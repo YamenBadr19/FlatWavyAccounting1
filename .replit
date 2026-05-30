@@ -17,3 +17,12 @@ deploymentTarget = "cloudrun"
 
 [agent]
 expertMode = true
+
+[userenv]
+
+[userenv.shared]
+SIGNALS_FOLDER_ID = "4"
+NEWS_FOLDER_ID = "2"
+SESSION_NAME = "gold_blueprint_session"
+CBOT_HTTP_URL = "http://localhost:8765/execute"
+LOG_LEVEL = "INFO"
