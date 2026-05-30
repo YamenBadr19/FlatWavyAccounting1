@@ -1,155 +1,83 @@
 """
-Signal Queue: cBot Bridge
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Drains validated signals from MarketAnalyzer and relays them
-to the C# cBot via HTTP WebSocket bridge (cTrader Open API).
+signal_queue.py — FIX Execution Bridge
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Drains validated signals from MarketAnalyzer and passes them to
+DualAccountFIXExecutor for simultaneous Live + Demo execution.
 
-The bridge writes signals to a local JSON file watched by the cBot
-(file-watch relay) OR POSTs them to the cBot's local HTTP endpoint
-if a WebSocket bridge is running.
-
-OPTIMIZATIONS:
-  - Non-blocking async relay with configurable timeout
-  - Persistent audit log (JSONL — one JSON object per line)
-  - Signal TTL: discard signals older than MAX_SIGNAL_AGE_SECONDS
-    (prevents stale signals from executing after a backlog clears)
-  - Atomic file write: write to .tmp then rename, preventing partial reads
-  - Graceful degradation: if cBot HTTP endpoint is unavailable,
-    falls back to file-watch relay automatically
+Also maintains a JSONL audit trail and enforces signal TTL
+(stale signals are discarded, never executed).
 """
 
 import asyncio
 import json
 import logging
-import os
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 from dataclasses import asdict
 
-logger = logging.getLogger('queue_bridge')
+from fix_executor import DualAccountFIXExecutor
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+logger = logging.getLogger('bridge')
 
-SIGNAL_OUTPUT_FILE  = Path("signal_latest.json")
 AUDIT_LOG_FILE      = Path("signal_audit.jsonl")
-MAX_SIGNAL_AGE_SECS = 30       # Signals older than 30s are discarded (stale)
-CBOT_HTTP_URL       = "http://localhost:8765/execute"  # cBot local bridge endpoint
-HTTP_TIMEOUT_SECS   = 3.0
+MAX_SIGNAL_AGE_SECS = 30
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# SIGNAL BRIDGE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class SignalBridge:
+class ExecutionBridge:
     """
-    Relays ValidatedSignal objects from the Python brain to the C# cBot.
-
-    Relay methods (tried in order):
-      1. HTTP POST to cBot local server (lowest latency, ~1ms)
-      2. Atomic JSON file write (file-watch fallback, ~5ms disk latency)
+    Reads validated signals from validated_queue, enforces TTL,
+    writes audit record, then calls DualAccountFIXExecutor.execute_signal().
     """
 
-    def __init__(self, validated_queue: asyncio.Queue):
+    def __init__(self, validated_queue: asyncio.Queue, fix_executor: DualAccountFIXExecutor):
         self.validated_queue = validated_queue
-        self._http_available = True
-        self._relay_count = 0
-        self._block_count = 0
-        logger.info("SignalBridge ready")
+        self.fix_executor    = fix_executor
+        self._relay_count    = 0
+        self._stale_count    = 0
+        logger.info("ExecutionBridge ready")
 
     async def relay_loop(self):
-        """Continuously drain validated signals and relay to cBot."""
-        logger.info("Signal relay loop started")
+        logger.info("Execution relay loop started")
         while True:
             validated = await self.validated_queue.get()
             try:
                 signal_dict = validated.to_dict() if hasattr(validated, 'to_dict') else asdict(validated)
 
-                # TTL check — discard stale signals
+                # TTL check
                 try:
-                    signal_ts = datetime.fromisoformat(signal_dict['timestamp'])
-                    if signal_ts.tzinfo is None:
-                        signal_ts = signal_ts.replace(tzinfo=timezone.utc)
-                    age_secs = (datetime.now(timezone.utc) - signal_ts).total_seconds()
-                    if age_secs > MAX_SIGNAL_AGE_SECS:
+                    ts = datetime.fromisoformat(signal_dict['timestamp'])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - ts).total_seconds()
+                    if age > MAX_SIGNAL_AGE_SECS:
                         logger.warning(
-                            f"[STALE] Discarding signal {signal_dict['signal_type']} @ "
-                            f"{signal_dict['entry_price']} — {age_secs:.0f}s old (max {MAX_SIGNAL_AGE_SECS}s)"
+                            f"[STALE] Signal {signal_dict['signal_type']} @ "
+                            f"{signal_dict['entry_price']} is {age:.0f}s old — discarded"
                         )
-                        self._block_count += 1
+                        self._stale_count += 1
+                        self._append_audit(signal_dict, "stale_discarded", {})
                         continue
                 except Exception as e:
                     logger.warning(f"TTL check failed: {e}")
 
-                relayed = await self._relay(signal_dict)
-                if relayed:
-                    self._relay_count += 1
-                    self._append_audit(signal_dict, status="relayed")
-                else:
-                    self._block_count += 1
-                    self._append_audit(signal_dict, status="relay_failed")
+                # Execute on both accounts simultaneously
+                results = await self.fix_executor.execute_signal(validated)
+                self._relay_count += 1
+                self._append_audit(signal_dict, "executed", results)
 
             except Exception as e:
                 logger.error(f"Relay error: {e}", exc_info=True)
             finally:
                 self.validated_queue.task_done()
 
-    async def _relay(self, signal_dict: dict) -> bool:
-        """Try HTTP first, fall back to file relay."""
-        if self._http_available:
-            success = await self._http_relay(signal_dict)
-            if success:
-                return True
-            logger.warning("HTTP relay failed — switching to file relay")
-            self._http_available = False
-
-        return self._file_relay(signal_dict)
-
-    async def _http_relay(self, signal_dict: dict) -> bool:
+    def _append_audit(self, signal_dict: dict, status: str, results: dict):
         try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    CBOT_HTTP_URL,
-                    json=signal_dict,
-                    timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECS)
-                ) as resp:
-                    if resp.status == 200:
-                        logger.info(
-                            f"[HTTP] Relayed {signal_dict['signal_type']} @ "
-                            f"{signal_dict['entry_price']} | Lot={signal_dict['lot_size']}"
-                        )
-                        return True
-                    logger.warning(f"[HTTP] cBot returned HTTP {resp.status}")
-                    return False
-        except Exception as e:
-            logger.warning(f"[HTTP] Relay exception: {e}")
-            return False
-
-    def _file_relay(self, signal_dict: dict) -> bool:
-        """Atomic file write: write to .tmp then rename to prevent partial reads."""
-        try:
-            tmp_path = SIGNAL_OUTPUT_FILE.with_suffix('.tmp')
-            payload = json.dumps(signal_dict, indent=2)
-            tmp_path.write_text(payload, encoding='utf-8')
-            tmp_path.rename(SIGNAL_OUTPUT_FILE)
-            logger.info(
-                f"[FILE] Relayed {signal_dict['signal_type']} @ "
-                f"{signal_dict['entry_price']} | Lot={signal_dict['lot_size']} → {SIGNAL_OUTPUT_FILE}"
-            )
-            return True
-        except OSError as e:
-            logger.error(f"[FILE] Write failed: {e}")
-            return False
-
-    def _append_audit(self, signal_dict: dict, status: str):
-        """Append to JSONL audit log (one record per line, never truncated)."""
-        try:
-            record = {**signal_dict, "relay_status": status, "relay_ts": datetime.utcnow().isoformat()}
+            record = {
+                **signal_dict,
+                "relay_status": status,
+                "relay_ts":     datetime.utcnow().isoformat(),
+                "fix_results":  results,
+            }
             with open(AUDIT_LOG_FILE, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(record) + '\n')
         except OSError as e:
@@ -157,7 +85,7 @@ class SignalBridge:
 
     def stats(self) -> dict:
         return {
-            "relayed": self._relay_count,
-            "blocked_or_stale": self._block_count,
-            "http_available": self._http_available,
+            "executed":  self._relay_count,
+            "stale":     self._stale_count,
+            **self.fix_executor.stats(),
         }
