@@ -26,3 +26,41 @@ NEWS_FOLDER_ID = "2"
 SESSION_NAME = "gold_blueprint_session"
 CBOT_HTTP_URL = "http://localhost:8765/execute"
 LOG_LEVEL = "INFO"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Gold Blueprint Brain"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Status Check"
+
+[[workflows.workflow]]
+name = "Gold Blueprint Brain"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "pip install -r requirements.txt -q && python watchdog.py"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "Status Check"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python status.py --watch 5"
+
+[workflows.workflow.metadata]
+outputType = "console"
