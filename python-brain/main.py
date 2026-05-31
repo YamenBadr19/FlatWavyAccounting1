@@ -50,6 +50,26 @@ HEARTBEAT_FILE     = Path("/tmp/gold_blueprint_heartbeat")
 HEARTBEAT_INTERVAL = 30   # seconds
 
 
+async def _market_data_sync_loop(market_feed, analyzer):
+    """
+    Every 5 seconds, push the latest MarketDataFeed snapshot into
+    MarketAnalyzer so its filters have current price, RSI, ATR, and pivots.
+    """
+    while True:
+        snap = market_feed.snapshot
+        analyzer.update_market_data({
+            'high':          snap.prev_high,
+            'low':           snap.prev_low,
+            'close':         snap.prev_close,
+            'current_price': snap.current_price,
+            'rsi_14':        snap.rsi_14,
+            'atr_14':        snap.atr_14,
+            'ema_50':        snap.ema_50,
+            'close_history': snap.close_history,
+        })
+        await asyncio.sleep(5)
+
+
 async def _heartbeat_loop():
     """
     Writes a Unix timestamp to HEARTBEAT_FILE every HEARTBEAT_INTERVAL seconds.
@@ -81,7 +101,7 @@ async def main():
         market_feed  = market_feed,
         be_monitor   = be_monitor,
     )
-    analyzer = MarketAnalyzer(signal_queue, validated_queue, market_feed, news_feed)
+    analyzer = MarketAnalyzer(signal_queue, news_queue, validated_queue)
     bridge   = ExecutionBridge(validated_queue, fix_executor)
 
     logger.info("=" * 65)
@@ -95,14 +115,15 @@ async def main():
 
     try:
         await asyncio.gather(
-            market_feed.run_forever(),            # 1. Live XAUUSD data
-            news_feed.run_forever(),              # 2. ForexFactory calendar
-            listener.run_with_reconnect(),        # 3. Telegram userbot
-            analyzer.process_signals_loop(),      # 4. 5-filter pipeline
-            fix_executor.run_forever(),           # 5. FIX LIVE + DEMO
-            bridge.relay_loop(),                  # 6. Execution relay
-            be_monitor.run_forever(),             # 7. Break-even monitor
-            _heartbeat_loop(),                    # 8. Watchdog liveness
+            market_feed.run_forever(),                      # 1. Live XAUUSD data
+            news_feed.run_forever(),                        # 2. ForexFactory calendar
+            listener.run_with_reconnect(),                  # 3. Telegram userbot
+            analyzer.run(),                                 # 4. 5-filter pipeline (signal + news loops)
+            fix_executor.run_forever(),                     # 5. FIX LIVE + DEMO
+            bridge.relay_loop(),                            # 6. Execution relay
+            be_monitor.run_forever(),                       # 7. Break-even monitor
+            _heartbeat_loop(),                              # 8. Watchdog liveness
+            _market_data_sync_loop(market_feed, analyzer),  # 9. Market data → analyzer
         )
     except KeyboardInterrupt:
         logger.info("Shutdown requested")

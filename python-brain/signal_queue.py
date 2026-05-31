@@ -161,3 +161,95 @@ class SignalBridge:
             "blocked_or_stale": self._block_count,
             "http_available": self._http_available,
         }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# EXECUTION BRIDGE  (FIX direct — replaces cBot relay)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ExecutionBridge:
+    """
+    Drains ValidatedSignal objects from validated_queue and fires them
+    directly through DualAccountFIXExecutor (LIVE + DEMO simultaneously).
+
+    Replaces SignalBridge's cBot HTTP/file relay — no cBot required.
+    """
+
+    def __init__(self, validated_queue: asyncio.Queue, fix_executor):
+        self.validated_queue = validated_queue
+        self.fix_executor    = fix_executor
+        self._exec_count     = 0
+        self._block_count    = 0
+        self._error_count    = 0
+        logger.info("ExecutionBridge ready (FIX direct mode)")
+
+    async def relay_loop(self):
+        """Continuously drain validated signals and execute via FIX."""
+        logger.info("ExecutionBridge relay loop started")
+        while True:
+            validated = await self.validated_queue.get()
+            try:
+                signal_dict = (
+                    validated.to_dict()
+                    if hasattr(validated, 'to_dict')
+                    else (validated if isinstance(validated, dict) else vars(validated))
+                )
+
+                # TTL check — discard stale signals
+                try:
+                    signal_ts = datetime.fromisoformat(signal_dict['timestamp'])
+                    if signal_ts.tzinfo is None:
+                        signal_ts = signal_ts.replace(tzinfo=timezone.utc)
+                    age_secs = (datetime.now(timezone.utc) - signal_ts).total_seconds()
+                    if age_secs > MAX_SIGNAL_AGE_SECS:
+                        logger.warning(
+                            f"[STALE] Discarding {signal_dict.get('signal_type','?')} @ "
+                            f"{signal_dict.get('entry_price','?')} — {age_secs:.0f}s old"
+                        )
+                        self._block_count += 1
+                        self._append_audit(signal_dict, status="stale_discarded")
+                        continue
+                except Exception as e:
+                    logger.warning(f"TTL check failed: {e}")
+
+                # Fire through FIX executor (LIVE + DEMO simultaneously)
+                try:
+                    result = await self.fix_executor.execute_signal(validated)
+                    self._exec_count += 1
+                    self._append_audit(signal_dict, status="executed", extra=result)
+                    logger.info(
+                        f"[FIX] Executed {signal_dict.get('signal_type','?')} @ "
+                        f"{signal_dict.get('entry_price','?')} | "
+                        f"Lot={signal_dict.get('lot_size','?')} | Result={result}"
+                    )
+                except Exception as e:
+                    self._error_count += 1
+                    self._append_audit(signal_dict, status="execution_error", extra={"error": str(e)})
+                    logger.error(f"[FIX] Execution error: {e}", exc_info=True)
+
+            except Exception as e:
+                logger.error(f"ExecutionBridge loop error: {e}", exc_info=True)
+            finally:
+                self.validated_queue.task_done()
+
+    def _append_audit(self, signal_dict: dict, status: str, extra: dict = None):
+        """Append to JSONL audit log (one record per line, never truncated)."""
+        try:
+            record = {
+                **signal_dict,
+                "relay_status": status,
+                "relay_ts": datetime.utcnow().isoformat(),
+            }
+            if extra:
+                record["execution_result"] = extra
+            with open(AUDIT_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(record) + '\n')
+        except OSError as e:
+            logger.error(f"Audit log write failed: {e}")
+
+    def stats(self) -> dict:
+        return {
+            "executed":      self._exec_count,
+            "stale_dropped": self._block_count,
+            "errors":        self._error_count,
+        }

@@ -708,8 +708,10 @@ class TelegramListener:
                 await self.client.get_entity(folder_id)
                 logger.info(f"{label} folder ({folder_id}): accessible ✓")
             except Exception as e:
-                logger.error(f"Cannot access {label} folder {folder_id}: {e}")
-                raise
+                logger.warning(
+                    f"Cannot access {label} folder {folder_id}: {e} "
+                    f"— listener will start but may not receive messages from this chat"
+                )
 
     def register_handlers(self):
         @self.client.on(events.NewMessage(chats=SIGNALS_FOLDER_ID))
