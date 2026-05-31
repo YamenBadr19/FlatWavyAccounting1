@@ -9,20 +9,23 @@ Signal flow:
            → DualAccountFIXExecutor.execute_signal()
            → asyncio.gather(LIVE FIX, DEMO FIX)   ← simultaneous
 
-Coroutines running in parallel:
-  1. MarketDataFeed.run_forever()       yfinance Gold data, 60s refresh
-  2. ForexNewsFeed.run_forever()        ForexFactory calendar, 5 min refresh
-  3. TelegramListener.run_with_reconnect()  Telegram userbot (Signal + News)
-  4. MarketAnalyzer.process_signals_loop()  5-filter validation pipeline
-  5. DualAccountFIXExecutor.run_forever()   LIVE + DEMO FIX sessions
-  6. ExecutionBridge.relay_loop()           Relay validated → FIX executor
-  7. BreakEvenMonitor.run_forever()         TP1/TP2 hit → move SL to entry
+Coroutines running in parallel (8 total):
+  1. MarketDataFeed.run_forever()          yfinance Gold data, 60s
+  2. ForexNewsFeed.run_forever()           ForexFactory calendar, 5 min
+  3. TelegramListener.run_with_reconnect() Telegram userbot
+  4. MarketAnalyzer.process_signals_loop() 5-filter pipeline
+  5. DualAccountFIXExecutor.run_forever()  LIVE + DEMO FIX sessions
+  6. ExecutionBridge.relay_loop()          Execution relay + audit
+  7. BreakEvenMonitor.run_forever()        TP1/TP2 → SL to break-even
+  8. _heartbeat_loop()                     Watchdog liveness signal
 """
 
 import asyncio
 import logging
 import sys
 import os
+import time
+from pathlib import Path
 
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -42,26 +45,44 @@ from market_analyzer   import MarketAnalyzer
 from fix_executor      import DualAccountFIXExecutor
 from signal_queue      import ExecutionBridge
 
+# Heartbeat file — watchdog checks this to detect hung brain
+HEARTBEAT_FILE     = Path("/tmp/gold_blueprint_heartbeat")
+HEARTBEAT_INTERVAL = 30   # seconds
+
+
+async def _heartbeat_loop():
+    """
+    Writes a Unix timestamp to HEARTBEAT_FILE every HEARTBEAT_INTERVAL seconds.
+    watchdog.py reads this file — if it goes stale the watchdog restarts the brain.
+    """
+    logger.info(f"Heartbeat loop started → {HEARTBEAT_FILE} (every {HEARTBEAT_INTERVAL}s)")
+    while True:
+        try:
+            HEARTBEAT_FILE.write_text(str(time.time()))
+        except OSError as e:
+            logger.warning(f"Heartbeat write failed: {e}")
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
 
 async def main():
-    # ── Queues ────────────────────────────────────────
+    # ── Queues ─────────────────────────────────────────
     signal_queue:    asyncio.Queue = asyncio.Queue(maxsize=100)
     news_queue:      asyncio.Queue = asyncio.Queue(maxsize=200)
     validated_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
-    # ── Components ────────────────────────────────────
+    # ── Components ─────────────────────────────────────
     market_feed  = MarketDataFeed()
     news_feed    = ForexNewsFeed()
     fix_executor = DualAccountFIXExecutor()
     be_monitor   = BreakEvenMonitor(market_feed=market_feed, fix_executor=fix_executor)
     listener     = TelegramListener(
-        signal_queue  = signal_queue,
-        news_queue    = news_queue,
-        market_feed   = market_feed,
-        be_monitor    = be_monitor,
+        signal_queue = signal_queue,
+        news_queue   = news_queue,
+        market_feed  = market_feed,
+        be_monitor   = be_monitor,
     )
-    analyzer     = MarketAnalyzer(signal_queue, validated_queue, market_feed, news_feed)
-    bridge       = ExecutionBridge(validated_queue, fix_executor)
+    analyzer = MarketAnalyzer(signal_queue, validated_queue, market_feed, news_feed)
+    bridge   = ExecutionBridge(validated_queue, fix_executor)
 
     logger.info("=" * 65)
     logger.info("  GOLD BLUEPRINT TRADING SYSTEM v2.0")
@@ -69,7 +90,7 @@ async def main():
     logger.info("=" * 65)
     logger.info("  Coroutines: MarketData | NewsCalendar | Telegram")
     logger.info("             5-Filter Analyzer | FIX LIVE+DEMO")
-    logger.info("             ExecutionBridge | BreakEvenMonitor")
+    logger.info("             ExecutionBridge | BreakEvenMonitor | Heartbeat")
     logger.info("=" * 65)
 
     try:
@@ -81,6 +102,7 @@ async def main():
             fix_executor.run_forever(),           # 5. FIX LIVE + DEMO
             bridge.relay_loop(),                  # 6. Execution relay
             be_monitor.run_forever(),             # 7. Break-even monitor
+            _heartbeat_loop(),                    # 8. Watchdog liveness
         )
     except KeyboardInterrupt:
         logger.info("Shutdown requested")
@@ -89,6 +111,10 @@ async def main():
         sys.exit(1)
     finally:
         await listener.stop()
+        try:
+            HEARTBEAT_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
         stats = bridge.stats()
         logger.info(f"Session stats: {stats}")
         logger.info("Gold Blueprint Brain — shutdown complete")
