@@ -1,0 +1,58 @@
+### 📥 Copy and Send this Final Updated Brief to Your Developer:
+**"Ultimate Production Request: Fully Adaptive telegram_listener.py Tailored to Live Channel Text Patterns (XAU/USD)**
+We have captured and analyzed the exact screenshot patterns from the target Telegram channel. The bot must be heavily optimized to handle the channel's specific syntax, custom emojis, text updates, and corporate spread rules. Please implement the complete script for telegram_listener.py integrated with the dual cTrader execution bridge using the following layout:
+### 0️⃣ Flexible Connection Layer (String Session vs Interactive)
+ * **Mode A (Silent Production):** If TELEGRAM_STRING_SESSION is detected in the environment variables, initialize the Telegram client silently via StringSession.
+ * **Mode B (Local Interactive):** If missing, fall back to standard interactive login asking for the phone number and SMS code via the terminal.
+### 1️⃣ Strict Performance & Narrative Chat Filter (فلتر حماية صارم للتحديثات الكلامية والنتائج)
+The channel frequently posts text-heavy update commentary or profit celebrations that contain numbers but are NOT new signals (e.g., *"البيع القديم مكمل كدا كدا"* or *"هدف أول 200 نقطه"*). The bot must immediately ignore (return) the message if it catches any of these phrases:
+ * **Profit & Target Milestones (قاموس الأرباح وتحديث الأهداف):**
+   * *Arabic keywords:* حققت, ضربت الأهداف, النتائج, حصيلة, تم إغلاق, مبروك, تحديث الإشارة, هدف أول, ربح, مكمل كدا كدا.
+   * *English/Spanish keywords:* hit tp, secured, pips gained, gained, closed at, done, summary, alcanzado.
+ * **Administrative Chat & Status Updates (قاموس التنويهات الإدارية والكلامية):**
+   * *Arabic keywords:* ليست للتداول, للمراقبة فقط, ملغاة, تأجيل, إشارة تجريبية, اليوم اجازه, صفقه محترمه ان شاء الله, اصحي معايا.
+   * *English keywords:* not for trading, cancelled, canceled, delete order, test signal.
+### 2️⃣ Mechanical Direction Logic & Custom Emoji Decoding (معالجة الأنماط المرئية والإيموجي المخصص)
+The channel writes BUY and SELL using **Custom Animated Emojis** (as seen in the screenshots XAUUSD SELL NOW 4460✅).
+ * The parser must extract variables using structural price logic first: If parsed TP1 > SL, direction is automatically **BUY**. If TP1 < SL, direction is **SELL**.
+ * **Sanity Double-Check:** Cross-reference this computed direction by scanning for the underlying Telegram MessageEntityCustomEmoji or standard fallback terms (BUY, SELL, شراء, COMPRA, VENTA). Drop the signal if a logical mathematical mismatch is found.
+### 3️⃣ Auto-Spread Calibration Layer (تطبيق قاعدة الـ 20 نقطة التلقائية للسبريد)
+Per the channel's institutional trading rules (*"اي استوب ينزل بتزود عليه 20 نقطه .. فرق الاسعار والاسبريد"*):
+ * Whenever the bot parses a Stop Loss (SL) value from a signal, it must **automatically pad the SL value by exactly 20 pips ($2.00 USD on Gold)**:
+   * For a **SELL** position: Final_SL = Parsed_SL + 2.0
+   * For a **BUY** position: Final_SL = Parsed_SL - 2.0
+ * This calculated price must be the one sent to the cTrader Live and Demo accounts to protect the trades from local broker spread spikes.
+### 4️⃣ Smart Entry Price Parsing (معالجة أسعار الدخول المباشرة والنطاقات)
+The channel heavily uses direct market executions (XAUUSD SELL NOW 4460 or XAUUSD BUY NOW 4381).
+ * Extract the entry anchor number following the action keywords.
+ * **Sanity Price Check:** Compare this target with the real-time Gold spot price from market_data_feed.py. If the variance abs(Live_Gold_Price - Parsed_Entry_Price) > 20.0, discard the order instantly to protect against lagging messages or severe human typing mistakes.
+### 5️⃣ Dynamic Break-Even Execution
+ * Once an order is active, the engine must track market feeds. As soon as the market price reaches the TP1 or TP2 mark, execute an immediate position modification via cTrader FIX API to move the active SL to the exact **break-even fill price** (0\% risk).
+### 📊 Environment Variables Setup (.env)
+```env
+TELEGRAM_API_ID=your_api_id_here
+TELEGRAM_API_HASH=your_api_hash_here
+TELEGRAM_SESSION_NAME=gold_blueprint_session
+TELEGRAM_STRING_SESSION=your_long_generated_string_session_here_if_applicable
+TARGET_CHANNEL_USERNAME=gold_signals_channel
+
+CTRADER_LIVE_ACCOUNT_ID=your_live_account_id
+CTRADER_LIVE_ACCESS_TOKEN=your_live_token
+CTRADER_DEMO_ACCOUNT_ID=your_demo_account_id
+CTRADER_DEMO_ACCESS_TOKEN=your_demo_token
+
+CTRADER_FIX_HOST=tradeapi.ctrader.com
+CTRADER_FIX_PORT=5012
+
+DEFAULT_LOT_SIZE_LIVE=0.01
+DEFAULT_LOT_SIZE_DEMO=0.10
+MAX_SANITY_DISTANCE_USD=20.0
+CHANNEL_SPREAD_PADDING_PIPS=2.0
+
+```
+### 🚀 Execution Terminal Command
+```bash
+python market_data_feed.py & python telegram_listener.py
+
+```
+Provide the complete, bug-free, fully operational Python code for telegram_listener.py built on these exact production parameters."

@@ -1,20 +1,22 @@
 """
-Gold Blueprint Trading System — Python Brain Entry Point
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Boots ALL coroutines in one asyncio.gather() call:
-
-  1. MarketDataFeed      — live XAUUSD data via yfinance (every 60s)
-  2. ForexNewsFeed       — ForexFactory calendar auto-detection (every 5min)
-  3. TelegramListener    — scrapes Signals & News folders (real-time)
-  4. MarketAnalyzer      — 5-filter validation pipeline (live data)
-  5. DualAccountFIXExecutor — maintains Live + Demo FIX sessions
-  6. ExecutionBridge     — relays validated signals to both FIX sessions
+Gold Blueprint Trading System — Python Brain
+Full Stack Entry Point
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Signal flow:
-  Telegram → signal_queue → MarketAnalyzer (5 filters + lot sizing)
-           → validated_queue → ExecutionBridge (TTL check + audit)
+  Telegram → [signal_queue] → MarketAnalyzer (5 filters + lot size)
+           → [validated_queue] → ExecutionBridge (TTL check + audit)
            → DualAccountFIXExecutor.execute_signal()
-           → asyncio.gather(LIVE FIX, DEMO FIX)  ← simultaneous
+           → asyncio.gather(LIVE FIX, DEMO FIX)   ← simultaneous
+
+Coroutines running in parallel:
+  1. MarketDataFeed.run_forever()       yfinance Gold data, 60s refresh
+  2. ForexNewsFeed.run_forever()        ForexFactory calendar, 5 min refresh
+  3. TelegramListener.run_with_reconnect()  Telegram userbot (Signal + News)
+  4. MarketAnalyzer.process_signals_loop()  5-filter validation pipeline
+  5. DualAccountFIXExecutor.run_forever()   LIVE + DEMO FIX sessions
+  6. ExecutionBridge.relay_loop()           Relay validated → FIX executor
+  7. BreakEvenMonitor.run_forever()         TP1/TP2 hit → move SL to entry
 """
 
 import asyncio
@@ -22,57 +24,66 @@ import logging
 import sys
 import os
 
-# Configure logging first
 log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, log_level, logging.INFO),
-    format='%(asctime)s [%(levelname)s] %(name)-15s: %(message)s',
+    format='%(asctime)s [%(levelname)s] %(name)-16s: %(message)s',
     handlers=[
         logging.FileHandler('gold_blueprint.log'),
         logging.StreamHandler(sys.stdout),
-    ]
+    ],
 )
 logger = logging.getLogger('main')
 
 from market_data_feed  import MarketDataFeed
 from news_feed         import ForexNewsFeed
-from telegram_listener import TelegramListener
+from telegram_listener import TelegramListener, BreakEvenMonitor
 from market_analyzer   import MarketAnalyzer
 from fix_executor      import DualAccountFIXExecutor
 from signal_queue      import ExecutionBridge
 
 
 async def main():
-    # ── Shared queues ──────────────────────────────────
+    # ── Queues ────────────────────────────────────────
     signal_queue:    asyncio.Queue = asyncio.Queue(maxsize=100)
     news_queue:      asyncio.Queue = asyncio.Queue(maxsize=200)
     validated_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
-    # ── Component instantiation ────────────────────────
+    # ── Components ────────────────────────────────────
     market_feed  = MarketDataFeed()
     news_feed    = ForexNewsFeed()
-    listener     = TelegramListener(signal_queue, news_queue)
-    analyzer     = MarketAnalyzer(signal_queue, validated_queue, market_feed, news_feed)
     fix_executor = DualAccountFIXExecutor()
+    be_monitor   = BreakEvenMonitor(market_feed=market_feed, fix_executor=fix_executor)
+    listener     = TelegramListener(
+        signal_queue  = signal_queue,
+        news_queue    = news_queue,
+        market_feed   = market_feed,
+        be_monitor    = be_monitor,
+    )
+    analyzer     = MarketAnalyzer(signal_queue, validated_queue, market_feed, news_feed)
     bridge       = ExecutionBridge(validated_queue, fix_executor)
 
     logger.info("=" * 65)
-    logger.info("  GOLD BLUEPRINT TRADING SYSTEM — FULL STACK ONLINE")
-    logger.info("  Brain (Python) + Body (FIX API) + Live Data + Calendar")
+    logger.info("  GOLD BLUEPRINT TRADING SYSTEM v2.0")
+    logger.info("  Python Brain — Full production stack online")
+    logger.info("=" * 65)
+    logger.info("  Coroutines: MarketData | NewsCalendar | Telegram")
+    logger.info("             5-Filter Analyzer | FIX LIVE+DEMO")
+    logger.info("             ExecutionBridge | BreakEvenMonitor")
     logger.info("=" * 65)
 
-    # ── Boot all coroutines simultaneously ─────────────
     try:
         await asyncio.gather(
-            market_feed.run_forever(),          # Live XAUUSD data
-            news_feed.run_forever(),            # ForexFactory calendar
-            listener.run_with_reconnect(),      # Telegram userbot
-            analyzer.process_signals_loop(),    # 5-filter pipeline
-            fix_executor.run_forever(),         # LIVE + DEMO FIX sessions
-            bridge.relay_loop(),                # Execution relay
+            market_feed.run_forever(),            # 1. Live XAUUSD data
+            news_feed.run_forever(),              # 2. ForexFactory calendar
+            listener.run_with_reconnect(),        # 3. Telegram userbot
+            analyzer.process_signals_loop(),      # 4. 5-filter pipeline
+            fix_executor.run_forever(),           # 5. FIX LIVE + DEMO
+            bridge.relay_loop(),                  # 6. Execution relay
+            be_monitor.run_forever(),             # 7. Break-even monitor
         )
     except KeyboardInterrupt:
-        logger.info("Shutdown requested by user")
+        logger.info("Shutdown requested")
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)

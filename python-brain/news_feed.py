@@ -1,67 +1,40 @@
 """
-news_feed.py — Forex Economic Calendar Auto-Detection
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Polls the ForexFactory public calendar JSON endpoint every NEWS_CHECK_SECS.
-Automatically activates News_Mode when a high-impact USD event is within
-NEWS_PRE_WINDOW_MINS minutes (before) or NEWS_POST_WINDOW_MINS (after).
+news_feed.py — ForexFactory Economic Calendar Auto-Detection
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Polls ForexFactory's public JSON endpoint every 5 minutes.
+Automatically activates News_Mode (0.01 lot cap) when a High-impact
+USD event is within ±30 minutes.
 
-This replaces the manual keyword-based news detection entirely.
-Both the pre-event and post-event windows enforce the 0.01 lot rule.
-
-No API key required — uses ForexFactory's public JSON feed.
-
-Backup source: Investing.com economic calendar RSS (if FF endpoint fails).
+No API key required.
 """
 
 import asyncio
 import logging
 import aiohttp
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-import json
 
 logger = logging.getLogger('news_feed')
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FF_CALENDAR_URL       = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_CHECK_SECS       = 300
+NEWS_PRE_WINDOW_MINS  = 30
+NEWS_POST_WINDOW_MINS = 30
+HIGH_IMPACT_LEVEL     = "High"
+GOLD_CURRENCIES       = {"USD", "XAU"}
 
-# ForexFactory public calendar JSON (no auth required)
-FF_CALENDAR_URL      = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-NEWS_CHECK_SECS      = 300          # Check every 5 minutes
-NEWS_PRE_WINDOW_MINS = 30           # Lock before event
-NEWS_POST_WINDOW_MINS = 30          # Lock after event
-HIGH_IMPACT_LEVEL    = "High"       # Only "High" impact events trigger News_Mode
-
-# Currency filters — events that affect Gold (USD-denominated)
-GOLD_RELEVANT_CURRENCIES = {"USD", "XAU"}
-
-# Specific high-impact event keywords (belt-and-suspenders on top of impact level)
-HIGH_IMPACT_EVENT_KEYWORDS = [
-    "FOMC", "Federal Funds Rate", "Interest Rate", "NFP", "Non-Farm",
-    "CPI", "Core CPI", "PPI", "GDP", "Retail Sales", "Unemployment",
-    "Powell", "Fed Chair", "JOLTS", "PCE", "Durable Goods",
-    "Monetary Policy", "Rate Decision", "Emergency",
-]
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DATA MODELS
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dataclass
 class EconomicEvent:
-    title:     str
-    currency:  str
-    impact:    str
-    event_dt:  datetime
-    forecast:  Optional[str] = None
-    previous:  Optional[str] = None
+    title:    str
+    currency: str
+    impact:   str
+    event_dt: datetime
 
     def minutes_until(self) -> float:
         now = datetime.now(timezone.utc)
-        dt = self.event_dt if self.event_dt.tzinfo else self.event_dt.replace(tzinfo=timezone.utc)
+        dt  = self.event_dt if self.event_dt.tzinfo else self.event_dt.replace(tzinfo=timezone.utc)
         return (dt - now).total_seconds() / 60.0
 
     def minutes_since(self) -> float:
@@ -70,159 +43,94 @@ class EconomicEvent:
 
 @dataclass
 class NewsModeStatus:
-    active:           bool = False
-    triggering_event: Optional[str] = None
+    active:           bool             = False
+    triggering_event: Optional[str]    = None
     activated_at:     Optional[datetime] = None
     expires_at:       Optional[datetime] = None
-    reason:           str = ""
+    reason:           str              = ""
 
     def minutes_remaining(self) -> float:
-        if not self.active or self.expires_at is None:
+        if not self.active or not self.expires_at:
             return 0.0
-        delta = (self.expires_at - datetime.now(timezone.utc)).total_seconds()
-        return max(0.0, delta / 60.0)
+        return max(0.0, (self.expires_at - datetime.now(timezone.utc)).total_seconds() / 60.0)
 
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# NEWS FEED
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ForexNewsFeed:
-    """
-    Polls ForexFactory for this week's high-impact USD events.
-    Maintains a NewsModeStatus that the MarketAnalyzer reads on every signal.
-
-    News_Mode is activated:
-      - NEWS_PRE_WINDOW_MINS before a High-impact USD event
-      - NEWS_POST_WINDOW_MINS after it completes
-
-    This enforces the strict 0.01 lot rule automatically — no manual trigger needed.
-    """
-
     def __init__(self):
-        self._status = NewsModeStatus()
-        self._upcoming_events: List[EconomicEvent] = []
-        self._lock = asyncio.Lock()
+        self._status: NewsModeStatus     = NewsModeStatus()
+        self._events: List[EconomicEvent] = []
         logger.info("ForexNewsFeed initialized")
 
     @property
     def status(self) -> NewsModeStatus:
         return self._status
 
-    @property
-    def upcoming_events(self) -> List[EconomicEvent]:
-        return self._upcoming_events
-
     async def fetch_calendar(self) -> bool:
-        """Fetch and parse this week's economic calendar."""
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as session:
-                async with session.get(FF_CALENDAR_URL) as resp:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+                async with s.get(FF_CALENDAR_URL) as resp:
                     if resp.status != 200:
-                        logger.warning(f"Calendar fetch returned HTTP {resp.status}")
                         return False
                     raw = await resp.json(content_type=None)
 
             events = []
             for item in raw:
-                currency = item.get("country", "").upper()
-                if currency not in GOLD_RELEVANT_CURRENCIES:
+                if item.get("country", "").upper() not in GOLD_CURRENCIES:
                     continue
-
-                impact = item.get("impact", "").capitalize()
-                if impact != HIGH_IMPACT_LEVEL:
+                if item.get("impact", "").capitalize() != HIGH_IMPACT_LEVEL:
                     continue
-
-                title = item.get("title", "")
                 date_str = item.get("date", "")
                 time_str = item.get("time", "")
-
                 try:
                     if time_str and time_str.lower() not in ("", "all day", "tentative"):
-                        dt_str = f"{date_str} {time_str}"
-                        event_dt = datetime.strptime(dt_str, "%Y-%m-%d %I:%M%p")
+                        event_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %I:%M%p")
                     else:
                         event_dt = datetime.strptime(date_str, "%Y-%m-%d")
                     event_dt = event_dt.replace(tzinfo=timezone.utc)
                 except ValueError:
                     continue
-
                 events.append(EconomicEvent(
-                    title=title,
-                    currency=currency,
-                    impact=impact,
+                    title=item.get("title", ""),
+                    currency=item.get("country", "").upper(),
+                    impact=HIGH_IMPACT_LEVEL,
                     event_dt=event_dt,
-                    forecast=item.get("forecast"),
-                    previous=item.get("previous"),
                 ))
 
-            async with self._lock:
-                self._upcoming_events = sorted(events, key=lambda e: e.event_dt)
-
-            logger.info(f"Calendar updated: {len(events)} high-impact USD events found this week")
-            if events:
-                for e in events[:5]:
-                    mins = e.minutes_until()
-                    logger.info(f"  [{e.impact}] {e.title} — {'+' if mins < 0 else ''}{mins:.0f} min")
+            self._events = sorted(events, key=lambda e: e.event_dt)
+            logger.info(f"Calendar: {len(events)} high-impact USD events this week")
             return True
-
         except Exception as e:
-            logger.error(f"Calendar fetch error: {e}", exc_info=True)
+            logger.error(f"Calendar error: {e}")
             return False
 
     def evaluate_news_mode(self) -> NewsModeStatus:
-        """
-        Check current events against time windows.
-        Returns the current NewsModeStatus.
-        """
-        now = datetime.now(timezone.utc)
-        new_status = NewsModeStatus(active=False)
+        now    = datetime.now(timezone.utc)
+        status = NewsModeStatus()
 
-        for event in self._upcoming_events:
-            mins_until = event.minutes_until()
-            mins_since = event.minutes_since()
-
-            # Pre-event window
-            if 0 <= mins_until <= NEWS_PRE_WINDOW_MINS:
-                expires = event.event_dt + timedelta(minutes=NEWS_POST_WINDOW_MINS)
-                new_status = NewsModeStatus(
-                    active=True,
-                    triggering_event=event.title,
-                    activated_at=now,
-                    expires_at=expires,
-                    reason=f"Pre-event: '{event.title}' in {mins_until:.0f} min"
-                )
+        for ev in self._events:
+            mu = ev.minutes_until()
+            ms = ev.minutes_since()
+            if 0 <= mu <= NEWS_PRE_WINDOW_MINS:
+                expires = ev.event_dt + timedelta(minutes=NEWS_POST_WINDOW_MINS)
+                status  = NewsModeStatus(True, ev.title, now, expires,
+                                         f"Pre-event: '{ev.title}' in {mu:.0f} min")
+                break
+            if 0 <= ms <= NEWS_POST_WINDOW_MINS:
+                expires = ev.event_dt + timedelta(minutes=NEWS_POST_WINDOW_MINS)
+                status  = NewsModeStatus(True, ev.title, ev.event_dt, expires,
+                                         f"Post-event: '{ev.title}' {ms:.0f} min ago")
                 break
 
-            # Post-event window
-            if 0 <= mins_since <= NEWS_POST_WINDOW_MINS:
-                expires = event.event_dt + timedelta(minutes=NEWS_POST_WINDOW_MINS)
-                new_status = NewsModeStatus(
-                    active=True,
-                    triggering_event=event.title,
-                    activated_at=event.event_dt,
-                    expires_at=expires,
-                    reason=f"Post-event: '{event.title}' released {mins_since:.0f} min ago"
-                )
-                break
-
-        if new_status.active != self._status.active:
-            if new_status.active:
-                logger.warning(
-                    f"NEWS_MODE ACTIVATED — {new_status.reason} | "
-                    f"Expires in {new_status.minutes_remaining():.0f} min | "
-                    f"All lots clamped to 0.01"
-                )
+        if status.active != self._status.active:
+            if status.active:
+                logger.warning(f"NEWS_MODE ON — {status.reason} | Lots clamped to 0.01")
             else:
-                logger.info("NEWS_MODE DEACTIVATED — Market window clear")
+                logger.info("NEWS_MODE OFF — Market clear")
 
-        self._status = new_status
-        return new_status
+        self._status = status
+        return status
 
     async def run_forever(self):
-        """Continuously refresh the calendar and evaluate news mode."""
         logger.info(f"News feed starting (refresh every {NEWS_CHECK_SECS}s)")
         while True:
             await self.fetch_calendar()
