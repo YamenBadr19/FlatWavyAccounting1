@@ -1,0 +1,1 @@
+- [Gold Blueprint Architecture](gold-blueprint-arch.md) — dual FIX 4.4 sessions + 7-coroutine asyncio design; StringSession is the production auth method
