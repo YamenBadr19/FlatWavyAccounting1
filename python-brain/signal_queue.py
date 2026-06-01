@@ -175,12 +175,13 @@ class ExecutionBridge:
     Replaces SignalBridge's cBot HTTP/file relay — no cBot required.
     """
 
-    def __init__(self, validated_queue: asyncio.Queue, fix_executor):
-        self.validated_queue = validated_queue
-        self.fix_executor    = fix_executor
-        self._exec_count     = 0
-        self._block_count    = 0
-        self._error_count    = 0
+    def __init__(self, validated_queue: asyncio.Queue, fix_executor, channel_reporter=None):
+        self.validated_queue  = validated_queue
+        self.fix_executor     = fix_executor
+        self._channel         = channel_reporter
+        self._exec_count      = 0
+        self._block_count     = 0
+        self._error_count     = 0
         logger.info("ExecutionBridge ready (FIX direct mode)")
 
     async def relay_loop(self):
@@ -222,6 +223,16 @@ class ExecutionBridge:
                         f"{signal_dict.get('entry_price','?')} | "
                         f"Lot={signal_dict.get('lot_size','?')} | Result={result}"
                     )
+                    # Log signal to private channel (non-blocking)
+                    if self._channel:
+                        cl_ord_id = result.get("live", "") if isinstance(result, dict) else ""
+                        asyncio.ensure_future(
+                            self._channel.report_signal(
+                                signal_dict = signal_dict,
+                                cl_ord_id   = cl_ord_id,
+                                source      = "SIGNALS",
+                            )
+                        )
                 except Exception as e:
                     self._error_count += 1
                     self._append_audit(signal_dict, status="execution_error", extra={"error": str(e)})

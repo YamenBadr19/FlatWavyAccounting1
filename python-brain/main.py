@@ -4,20 +4,23 @@ Full Stack Entry Point
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Signal flow:
-  Telegram → [signal_queue] → MarketAnalyzer (5 filters + lot size)
+  Telegram → [signal_queue] → MarketAnalyzer (5 filters + dynamic lot size)
            → [validated_queue] → ExecutionBridge (TTL check + audit)
            → DualAccountFIXExecutor.execute_signal()
            → asyncio.gather(LIVE FIX, DEMO FIX)   ← simultaneous
 
-Coroutines running in parallel (8 total):
-  1. MarketDataFeed.run_forever()          yfinance Gold data, 60s
-  2. ForexNewsFeed.run_forever()           ForexFactory calendar, 5 min
-  3. TelegramListener.run_with_reconnect() Telegram userbot
-  4. MarketAnalyzer.process_signals_loop() 5-filter pipeline
-  5. DualAccountFIXExecutor.run_forever()  LIVE + DEMO FIX sessions
-  6. ExecutionBridge.relay_loop()          Execution relay + audit
-  7. BreakEvenMonitor.run_forever()        TP1/TP2 → SL to break-even
-  8. _heartbeat_loop()                     Watchdog liveness signal
+Coroutines running in parallel (11 total):
+  1.  MarketDataFeed.run_forever()          yfinance Gold data, 60s
+  2.  ForexNewsFeed.run_forever()           ForexFactory calendar, 5 min
+  3.  TelegramListener.run_with_reconnect() Telegram userbot
+  4.  MarketAnalyzer.run()                  5-filter pipeline
+  5.  DualAccountFIXExecutor.run_forever()  LIVE + DEMO FIX sessions
+  6.  ExecutionBridge.relay_loop()          Execution relay + audit
+  7.  BreakEvenMonitor.run_forever()        Tier1/2 SL + trailing stop
+  8.  BalanceManager.run_forever()          MCP balance polling (30s)
+  9.  ControlBot.run_forever()              Telegram control commands
+  10. _heartbeat_loop()                     Watchdog liveness signal
+  11. _market_data_sync_loop()              Market data → analyzer (5s)
 """
 
 import asyncio
@@ -44,6 +47,9 @@ from telegram_listener import TelegramListener, BreakEvenMonitor
 from market_analyzer   import MarketAnalyzer
 from fix_executor      import DualAccountFIXExecutor
 from signal_queue      import ExecutionBridge
+from balance_manager   import BalanceManager
+from channel_reporter  import ChannelReporter
+from control_bot       import ControlBot
 
 # Heartbeat file — watchdog checks this to detect hung brain
 HEARTBEAT_FILE     = Path("/tmp/gold_blueprint_heartbeat")
@@ -90,40 +96,78 @@ async def main():
     news_queue:      asyncio.Queue = asyncio.Queue(maxsize=200)
     validated_queue: asyncio.Queue = asyncio.Queue(maxsize=50)
 
-    # ── Components ─────────────────────────────────────
-    market_feed  = MarketDataFeed()
-    news_feed    = ForexNewsFeed()
-    fix_executor = DualAccountFIXExecutor()
-    be_monitor   = BreakEvenMonitor(market_feed=market_feed, fix_executor=fix_executor)
-    listener     = TelegramListener(
+    # ── Core components ────────────────────────────────
+    market_feed     = MarketDataFeed()
+    news_feed       = ForexNewsFeed()
+    balance_manager = BalanceManager()
+    channel_reporter = ChannelReporter()
+
+    fix_executor = DualAccountFIXExecutor(
+        balance_manager  = balance_manager,
+        channel_reporter = channel_reporter,
+    )
+
+    be_monitor = BreakEvenMonitor(
+        market_feed      = market_feed,
+        fix_executor     = fix_executor,
+        channel_reporter = channel_reporter,
+    )
+
+    listener = TelegramListener(
         signal_queue = signal_queue,
         news_queue   = news_queue,
         market_feed  = market_feed,
         be_monitor   = be_monitor,
     )
-    analyzer = MarketAnalyzer(signal_queue, news_queue, validated_queue)
-    bridge   = ExecutionBridge(validated_queue, fix_executor)
+
+    # Wire the shared Telegram client into channel reporter
+    # (Client object exists at construction; connection happens at listener.start())
+    channel_reporter.set_client(listener.client)
+
+    analyzer = MarketAnalyzer(
+        signal_queue    = signal_queue,
+        news_queue      = news_queue,
+        validated_queue = validated_queue,
+        balance_manager = balance_manager,
+    )
+
+    bridge = ExecutionBridge(
+        validated_queue  = validated_queue,
+        fix_executor     = fix_executor,
+        channel_reporter = channel_reporter,
+    )
+
+    control_bot = ControlBot(
+        balance_manager = balance_manager,
+        fix_executor    = fix_executor,
+        news_feed       = news_feed,
+        market_feed     = market_feed,
+    )
 
     logger.info("=" * 65)
-    logger.info("  GOLD BLUEPRINT TRADING SYSTEM v2.0")
-    logger.info("  Python Brain — Full production stack online")
+    logger.info("  GOLD BLUEPRINT TRADING SYSTEM v3.0")
+    logger.info("  Python Brain — Fully Autonomous Production Stack")
     logger.info("=" * 65)
     logger.info("  Coroutines: MarketData | NewsCalendar | Telegram")
-    logger.info("             5-Filter Analyzer | FIX LIVE+DEMO")
-    logger.info("             ExecutionBridge | BreakEvenMonitor | Heartbeat")
+    logger.info("             5-Filter Analyzer | FIX LIVE+DEMO (SSL)")
+    logger.info("             ExecutionBridge | Tier1/2+Trail SL Mgr")
+    logger.info("             BalanceManager (MCP) | ControlBot")
+    logger.info("             ChannelReporter | Heartbeat")
     logger.info("=" * 65)
 
     try:
         await asyncio.gather(
-            market_feed.run_forever(),                      # 1. Live XAUUSD data
-            news_feed.run_forever(),                        # 2. ForexFactory calendar
-            listener.run_with_reconnect(),                  # 3. Telegram userbot
-            analyzer.run(),                                 # 4. 5-filter pipeline (signal + news loops)
-            fix_executor.run_forever(),                     # 5. FIX LIVE + DEMO
-            bridge.relay_loop(),                            # 6. Execution relay
-            be_monitor.run_forever(),                       # 7. Break-even monitor
-            _heartbeat_loop(),                              # 8. Watchdog liveness
-            _market_data_sync_loop(market_feed, analyzer),  # 9. Market data → analyzer
+            market_feed.run_forever(),                       # 1.  Live XAUUSD data
+            news_feed.run_forever(),                         # 2.  ForexFactory calendar
+            listener.run_with_reconnect(),                   # 3.  Telegram userbot
+            analyzer.run(),                                  # 4.  5-filter pipeline
+            fix_executor.run_forever(),                      # 5.  FIX LIVE + DEMO
+            bridge.relay_loop(),                             # 6.  Execution relay
+            be_monitor.run_forever(),                        # 7.  Tier1/2 + trailing SL
+            balance_manager.run_forever(),                   # 8.  MCP balance polling
+            control_bot.run_forever(),                       # 9.  Telegram control bot
+            _heartbeat_loop(),                               # 10. Watchdog liveness
+            _market_data_sync_loop(market_feed, analyzer),  # 11. Market data → analyzer
         )
     except KeyboardInterrupt:
         logger.info("Shutdown requested")

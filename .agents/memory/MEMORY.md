@@ -1,1 +1,3 @@
-- [Gold Blueprint Architecture](gold-blueprint-arch.md) — dual FIX 4.4 sessions + 7-coroutine asyncio design; StringSession is the production auth method
+- [Gold Blueprint Architecture](gold-blueprint-arch.md) — dual FIX 4.4 sessions + 11-coroutine asyncio design; StringSession is the production auth method
+- [FIX Logon Rejection](fix-logon.md) — Broker TCP-closes before sending FIX msg type 3; Tag58 won't appear in logs; credential issue requires broker support ticket.
+- [XAUUSD Lot Sizing](xauusd-lot-math.md) — lot = risk_usd / (sl_distance_usd × 100); 1 std lot = $100/dollar-move; BalanceManager wraps this with MCP→FIX→DEFAULT fallback chain.

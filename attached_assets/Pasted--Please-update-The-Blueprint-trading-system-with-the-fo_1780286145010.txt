@@ -1,0 +1,31 @@
+> **"Please update 'The Blueprint' trading system with the following complete implementation requirements:**
+> **1. LOCAL MCP SERVER INTEGRATION:**
+> Create a file named .mcp.json in the root directory of the project and paste this configuration exactly to route trades locally to cTrader:
+> ```json
+> {
+>   "mcpServers": {
+>     "ctrader": {
+>       "type": "http",
+>       "url": "http://127.0.0.1:9876/mcp/"
+>     }
+>   }
+> }
+> 
+> ```
+> Configure a secure bridge so the cloud server can forward Telegram signals directly to this local environment. Manual confirmation is disabled in cTrader; ensure all trades execute instantly.
+> **2. TELEGRAM FOLDERS & MANIPULATION BOT:**
+>  * Implement GetDialogFiltersRequest to dynamically fetch signals from Folder ID 4 and news from Folder ID 2. The listener must update at startup without needing code restarts.
+>  * Integrate a 'Telegram Control Bot' (using python-telegram-bot) to allow manual Start/Stop and status tracking via chat.
+> **3. PRIVATE SIGNAL & SOURCE LOGGING CHANNEL:**
+> Forward every processed signal to my private Telegram channel. Format must be clean, showing the original signal source. Send live updates whenever a trade is triggered, hits Take Profit, or hits Stop Loss.
+> **4. POSITION ID TRACKING & DYNAMIC SELF-UPDATING MESSAGE (NO LOCAL STORAGE):**
+> Do not store trade history on the cloud server. Use Telegram as the 'Source of Truth'. For every trade, extract the official 'Position ID' from cTrader and include it in the channel message. To manage active trades, the bot must parse the 'last status message' in the channel to identify open Position IDs. Upon a close signal, the bot must: 1) Update the trade status, and 2) Automatically edit the 'last status message' to remove the closed Position ID, ensuring the list of open trades is always synchronized.
+> **5. SMART DYNAMIC STOP-LOSS & BREAK-EVEN MANAGEMENT:**
+>  * **Tier 1 (Small Targets):** Upon hitting TP1, move Stop Loss to **Entry Price** (Break-Even).
+>  * **Tier 2 (Large Targets):** Upon hitting TP2, trail Stop Loss to TP1 level.
+>  * **Dynamic Trailing:** Maintain this step-by-step trailing to ensure Stop Loss always protects realized milestones.
+> **6. SMART TRAILING STOP FOR LONG-TERM TARGETS (HIGH PROFIT):**
+> For trades where profit exceeds $40-$50 (on minimum lot), activate an advanced Trailing Stop once profit hits $20. The Stop Loss must follow the price at a fixed distance (e.g., 15-20 pips), keeping the trailing logic active until the market hits the final TP or Stop Loss.
+> **7. FIX API BACKUP LINE (PORT 5212):**
+> If we fall back to the FIX API, initiate connection with SSL enabled (ssl.create_default_context()). If a Logon Rejected error occurs, parse and log the full dictionary payload (Tag 58) to identify the error reason."
+>

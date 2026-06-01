@@ -24,6 +24,7 @@ Credentials (set in Replit Secrets):
 import asyncio
 import logging
 import os
+import ssl
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Callable, Dict
@@ -104,39 +105,58 @@ class FIXMessage:
 class AsyncFIXSession:
     def __init__(
         self,
-        account_name:   str,
-        host:           str,
-        port:           int,
-        sender_comp_id: str,
-        target_comp_id: str,
-        sender_sub_id:  str,
-        password:       str,
-        on_exec_report: Optional[Callable] = None,
+        account_name:      str,
+        host:              str,
+        port:              int,
+        sender_comp_id:    str,
+        target_comp_id:    str,
+        sender_sub_id:     str,
+        password:          str,
+        on_exec_report:    Optional[Callable] = None,
+        on_balance_update: Optional[Callable] = None,
+        use_ssl:           bool = True,
     ):
-        self.account_name   = account_name
-        self.host           = host
-        self.port           = port
-        self.sender         = sender_comp_id
-        self.target         = target_comp_id
-        self.sub_id         = sender_sub_id
-        self.password       = password
-        self.on_exec_report = on_exec_report
+        self.account_name      = account_name
+        self.host              = host
+        self.port              = port
+        self.sender            = sender_comp_id
+        self.target            = target_comp_id
+        self.sub_id            = sender_sub_id
+        self.password          = password
+        self.on_exec_report    = on_exec_report
+        self.on_balance_update = on_balance_update
+        self.use_ssl           = use_ssl
 
-        self._seq           = 1
+        self._seq             = 1
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
-        self._logged_in     = False
-        self._running       = False
+        self._logged_in       = False
+        self._running         = False
         self._reconnect_delay = RECONNECT_BASE
         self._orders: Dict[str, dict] = {}   # clOrdId → signal dict
 
-        logger.info(f"[{account_name}] FIX session configured ({host}:{port})")
+        logger.info(f"[{account_name}] FIX session configured ({host}:{port}) SSL={'ON' if use_ssl else 'OFF'}")
 
     # ── Connection ─────────────────────────────────────
 
     async def connect(self):
-        self._reader, self._writer = await asyncio.open_connection(self.host, self.port)
-        logger.info(f"[{self.account_name}] TCP connected → {self.host}:{self.port}")
+        ssl_ctx = ssl.create_default_context() if self.use_ssl else None
+        try:
+            self._reader, self._writer = await asyncio.open_connection(
+                self.host, self.port, ssl=ssl_ctx
+            )
+            logger.info(
+                f"[{self.account_name}] TCP connected → {self.host}:{self.port} "
+                f"({'TLS' if self.use_ssl else 'plain'})"
+            )
+        except ssl.SSLError as e:
+            logger.warning(
+                f"[{self.account_name}] SSL failed ({e}), retrying without SSL"
+            )
+            self._reader, self._writer = await asyncio.open_connection(
+                self.host, self.port
+            )
+            logger.info(f"[{self.account_name}] TCP connected (plain fallback) → {self.host}:{self.port}")
         await self._send_logon()
 
     async def _send_logon(self):
@@ -282,13 +302,27 @@ class AsyncFIXSession:
         mt   = tags.get(35, "")
 
         if mt == MSG_LOGON:
-            self._logged_in     = True
+            self._logged_in       = True
             self._reconnect_delay = RECONNECT_BASE
             logger.info(f"[{self.account_name}] Logged in ✓")
+            # Some brokers send balance tags on logon
+            self._maybe_update_balance(tags)
 
         elif mt == MSG_LOGOUT:
             self._logged_in = False
-            logger.warning(f"[{self.account_name}] Logout: {tags.get(58, '')}")
+            reason = tags.get(58, "")
+            logger.warning(f"[{self.account_name}] Logout received | Tag58={reason!r}")
+
+        elif mt == "3":   # Session-level Reject
+            ref_msg  = tags.get(372, "?")
+            tag_ref  = tags.get(371, "?")
+            reason   = tags.get(58,  "No reason given")
+            logger.error(
+                f"[{self.account_name}] LOGON REJECTED | "
+                f"Reason (Tag58): {reason!r} | "
+                f"RefMsgType={ref_msg} | RefTagID={tag_ref} | "
+                f"Full payload: {dict(tags)}"
+            )
 
         elif mt == MSG_TEST_REQUEST:
             hb = FIXMessage(MSG_HEARTBEAT)
@@ -296,18 +330,45 @@ class AsyncFIXSession:
             await self._send(hb)
 
         elif mt == MSG_EXEC_REPORT:
-            ord_status = tags.get(39, "")
-            cl_id      = tags.get(11, "")
-            avg_px     = tags.get(31, "N/A")
-            status_map = {"0": "New", "1": "Partial", "2": "Filled", "8": "Rejected", "4": "Cancelled"}
+            ord_status  = tags.get(39, "")
+            cl_id       = tags.get(11, "")
+            avg_px      = tags.get(31, "N/A")
+            position_id = tags.get(37, tags.get(721, ""))   # Tag 37=OrderID, 721=PosMaintRptID
+            status_map  = {
+                "0": "New", "1": "Partial", "2": "Filled",
+                "8": "Rejected", "4": "Cancelled",
+            }
             label = status_map.get(ord_status, ord_status)
             if ord_status == "8":
-                logger.error(f"[{self.account_name}] REJECTED {cl_id} | {tags.get(58, '')}")
+                reject_reason = tags.get(58, "")
+                logger.error(
+                    f"[{self.account_name}] ORDER REJECTED | ClOrdID={cl_id} | "
+                    f"Reason (Tag58): {reject_reason!r} | Full: {dict(tags)}"
+                )
             else:
-                logger.info(f"[{self.account_name}] ExecReport {label} | {cl_id} @ {avg_px}")
+                logger.info(
+                    f"[{self.account_name}] ExecReport {label} | "
+                    f"ClOrdID={cl_id} @ {avg_px} | PositionID={position_id}"
+                )
+            self._maybe_update_balance(tags)
             if self.on_exec_report:
                 await self.on_exec_report(self.account_name, tags)
             self._orders.pop(cl_id, None)
+
+    def _maybe_update_balance(self, tags: dict):
+        """Parse equity/free-margin balance tags if present and fire callback."""
+        # Tag 9003/9004 are common cTrader custom tags for balance/equity
+        equity      = tags.get(9003) or tags.get(9011)
+        free_margin = tags.get(9004) or tags.get(9012)
+        if equity:
+            try:
+                eq = float(equity)
+                fm = float(free_margin) if free_margin else eq
+                if self.on_balance_update:
+                    asyncio.ensure_future(self.on_balance_update(eq, fm))
+                logger.debug(f"[{self.account_name}] Balance tags: equity={eq} free_margin={fm}")
+            except (ValueError, TypeError):
+                pass
 
     # ── Reconnect loop ─────────────────────────────────
 
@@ -342,8 +403,14 @@ class DualAccountFIXExecutor:
     modify_position_sl() — simultaneous SL modification on both accounts
     """
 
-    def __init__(self):
+    def __init__(self, balance_manager=None, channel_reporter=None):
         def e(k, d=""): return os.environ.get(k, d).strip()
+        use_ssl = os.environ.get("FIX_USE_SSL", "true").lower() != "false"
+
+        self._balance_mgr    = balance_manager
+        self._channel        = channel_reporter
+        self._executed       = 0
+        self._rejected       = 0
 
         self.live_session = AsyncFIXSession(
             "LIVE",
@@ -353,7 +420,9 @@ class DualAccountFIXExecutor:
             e("FIX_LIVE_TARGET_COMP_ID"),
             e("FIX_LIVE_SENDER_SUB_ID"),
             e("FIX_LIVE_PASSWORD"),
-            on_exec_report=self._on_exec,
+            on_exec_report    = self._on_exec,
+            on_balance_update = self._on_balance,
+            use_ssl           = use_ssl,
         )
         self.demo_session = AsyncFIXSession(
             "DEMO",
@@ -363,17 +432,26 @@ class DualAccountFIXExecutor:
             e("FIX_DEMO_TARGET_COMP_ID"),
             e("FIX_DEMO_SENDER_SUB_ID"),
             e("FIX_DEMO_PASSWORD"),
-            on_exec_report=self._on_exec,
+            on_exec_report    = self._on_exec,
+            on_balance_update = self._on_balance,
+            use_ssl           = use_ssl,
         )
-        self._executed = 0
-        self._rejected = 0
         logger.info("DualAccountFIXExecutor initialized (LIVE + DEMO)")
 
     async def _on_exec(self, account: str, tags: dict):
-        if tags.get(39) == "8":
+        ord_status  = tags.get(39, "")
+        cl_id       = tags.get(11, "")
+        position_id = tags.get(37, tags.get(721, ""))
+        if ord_status == "8":
             self._rejected += 1
-        elif tags.get(39) in ("1", "2"):
+        elif ord_status in ("1", "2"):
             self._executed += 1
+            if position_id and cl_id and self._channel:
+                self._channel.register_position_id(cl_id, position_id)
+
+    async def _on_balance(self, equity: float, free_margin: float):
+        if self._balance_mgr:
+            self._balance_mgr.update_from_fix(equity, free_margin)
 
     async def execute_signal(self, validated_signal) -> Dict:
         """Fire LIVE + DEMO simultaneously. Returns {live: clOrdId, demo: clOrdId}."""

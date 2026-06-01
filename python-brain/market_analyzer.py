@@ -394,20 +394,25 @@ class MarketAnalyzer:
 
     def __init__(
         self,
-        signal_queue: asyncio.Queue,
-        news_queue: asyncio.Queue,
+        signal_queue:    asyncio.Queue,
+        news_queue:      asyncio.Queue,
         validated_queue: asyncio.Queue,
+        balance_manager  = None,
     ):
-        self.signal_queue = signal_queue
-        self.news_queue = news_queue
+        self.signal_queue    = signal_queue
+        self.news_queue      = news_queue
         self.validated_queue = validated_queue
+        self._balance_mgr    = balance_manager
 
         self.sentiment_filter = NewsSentimentFilter()
-        self.pivot_filter = PivotPointFilter()
-        self.rsi_filter = RSIFilter()
+        self.pivot_filter     = PivotPointFilter()
+        self.rsi_filter       = RSIFilter()
 
         self._market_data: Dict = {}
-        logger.info("MarketAnalyzer initialized")
+        logger.info(
+            "MarketAnalyzer initialized | "
+            f"Lot sizing: {'dynamic (live balance)' if balance_manager else 'static schedule'}"
+        )
 
     def update_market_data(self, data: Dict):
         """
@@ -515,7 +520,15 @@ class MarketAnalyzer:
         else:
             confluence_level = tech_pass_count
 
-        lot_size = determine_lot_size(confluence_level, news_mode_active)
+        if self._balance_mgr is not None:
+            lot_size = self._balance_mgr.calculate_lot_size(
+                entry_price      = entry_price,
+                stop_loss        = stop_loss,
+                confluence_level = confluence_level,
+                news_mode        = news_mode_active,
+            )
+        else:
+            lot_size = determine_lot_size(confluence_level, news_mode_active)
         is_ready = not blocked and confluence_level >= 1
 
         validated = ValidatedSignal(

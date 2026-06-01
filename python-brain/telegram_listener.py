@@ -44,6 +44,7 @@ from telethon.tl.types import (
     MessageEntityBold,
     MessageEntityTextUrl,
 )
+from telethon.tl.functions.messages import GetDialogFiltersRequest
 
 logger = logging.getLogger('radar')
 
@@ -78,6 +79,10 @@ DEDUP_WINDOW_SECS        = 60
 MAX_RECONNECT_ATTEMPTS   = 20
 BASE_RECONNECT_DELAY     = 2.0
 BREAK_EVEN_POLL_SECS     = 5
+
+# Trailing stop settings (can be overridden by env vars)
+TRAILING_STOP_USD         = _ef("TRAILING_STOP_USD",         2.0)   # trail distance $
+TRAILING_PROFIT_THRESHOLD = _ef("TRAILING_PROFIT_THRESHOLD", 20.0)  # activate at $20 profit
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -550,7 +555,7 @@ class DeduplicationCache:
 
 @dataclass
 class ActivePosition:
-    """Tracks one open position across both accounts for break-even management."""
+    """Tracks one open position across both accounts for all SL management."""
     cl_ord_id_live:  str
     cl_ord_id_demo:  str
     signal_type:     str
@@ -558,33 +563,48 @@ class ActivePosition:
     stop_loss:       float
     tp1:             float
     tp2:             Optional[float]
-    be_triggered:    bool = False       # True once break-even has fired
-    opened_at:       str  = ""
+    lot_size:        float = 0.01      # needed for P&L calc
+    be_triggered:    bool  = False     # True once Tier-1 BE has fired
+    tp2_triggered:   bool  = False     # True once Tier-2 (SL→TP1) has fired
+    trailing_active: bool  = False     # True once advanced trailing is active
+    current_sl:      float = 0.0       # live SL value (updated as trailing moves)
+    position_id:     str   = ""        # cTrader position ID from FIX exec report
+    opened_at:       str   = ""
 
 
 class BreakEvenMonitor:
     """
     Background task that polls live spot price every BREAK_EVEN_POLL_SECS seconds.
-    When price reaches TP1 (or TP2 if set), fires a FIX position modification
-    to move SL on BOTH accounts to the original entry price (break-even).
 
-    After break-even fires, the position is removed from tracking.
+    Three-tier SL management:
+      Tier 1 — TP1 hit          → SL moved to Entry Price (zero risk)
+      Tier 2 — TP2 hit          → SL moved to TP1 level  (lock TP1 profit)
+      Trailing — profit ≥ $20   → SL trails price at TRAILING_STOP_USD distance
+                                   (activates once, stays active until close)
     """
 
-    def __init__(self, market_feed, fix_executor):
-        self._positions: List[ActivePosition] = []
-        self._lock       = asyncio.Lock()
-        self.market_feed = market_feed
-        self.fix_executor = fix_executor
-        logger.info("BreakEvenMonitor initialized")
+    def __init__(self, market_feed, fix_executor, channel_reporter=None):
+        self._positions:   List[ActivePosition] = []
+        self._lock         = asyncio.Lock()
+        self.market_feed   = market_feed
+        self.fix_executor  = fix_executor
+        self._channel      = channel_reporter
+        logger.info(
+            f"BreakEvenMonitor initialized | "
+            f"Trail distance=${TRAILING_STOP_USD} | "
+            f"Trail activates at ${TRAILING_PROFIT_THRESHOLD} profit"
+        )
 
     async def register(self, position: ActivePosition):
+        """Register an open position for SL management."""
+        if position.current_sl == 0.0:
+            position.current_sl = position.stop_loss
         async with self._lock:
             self._positions.append(position)
         logger.info(
-            f"[BE] Tracking position {position.cl_ord_id_live} | "
-            f"{position.signal_type} @ {position.entry_price} | "
-            f"TP1={position.tp1} | BE triggers at TP1"
+            f"[BE] Tracking {position.signal_type} @ {position.entry_price} | "
+            f"SL={position.stop_loss} | TP1={position.tp1} | TP2={position.tp2} | "
+            f"Lot={position.lot_size} | ID={position.cl_ord_id_live}"
         )
 
     async def run_forever(self):
@@ -600,55 +620,118 @@ class BreakEvenMonitor:
             return
 
         async with self._lock:
-            remaining = []
+            still_open = []
             for pos in self._positions:
-                if pos.be_triggered:
-                    continue
 
-                hit_tp1 = (
-                    (pos.signal_type == "BUY"  and price >= pos.tp1) or
-                    (pos.signal_type == "SELL" and price <= pos.tp1)
-                )
-                hit_tp2 = (
-                    pos.tp2 is not None and (
+                # ── Tier 2: TP2 hit → SL to TP1 ────────────────────────
+                if not pos.tp2_triggered and pos.tp2 is not None:
+                    hit_tp2 = (
                         (pos.signal_type == "BUY"  and price >= pos.tp2) or
                         (pos.signal_type == "SELL" and price <= pos.tp2)
                     )
-                )
+                    if hit_tp2:
+                        logger.info(
+                            f"[BE-T2] TP2 hit on {pos.cl_ord_id_live} | "
+                            f"price={price} | Moving SL to TP1={pos.tp1}"
+                        )
+                        await self._modify_sl(pos, new_sl=pos.tp1)
+                        pos.tp2_triggered = True
+                        pos.current_sl    = pos.tp1
+                        if self._channel and pos.position_id:
+                            asyncio.ensure_future(
+                                self._channel.update_tp2(pos.position_id, price)
+                            )
+                        still_open.append(pos)
+                        continue
 
-                if hit_tp1 or hit_tp2:
-                    trigger = "TP2" if hit_tp2 else "TP1"
-                    logger.info(
-                        f"[BE] {trigger} reached on {pos.cl_ord_id_live} | "
-                        f"Price={price} | Moving SL to break-even={pos.entry_price}"
+                # ── Tier 1: TP1 hit → SL to entry ───────────────────────
+                if not pos.be_triggered:
+                    hit_tp1 = (
+                        (pos.signal_type == "BUY"  and price >= pos.tp1) or
+                        (pos.signal_type == "SELL" and price <= pos.tp1)
                     )
-                    await self._fire_break_even(pos)
-                    pos.be_triggered = True
-                else:
-                    remaining.append(pos)
+                    if hit_tp1:
+                        logger.info(
+                            f"[BE-T1] TP1 hit on {pos.cl_ord_id_live} | "
+                            f"price={price} | Moving SL to entry={pos.entry_price}"
+                        )
+                        await self._modify_sl(pos, new_sl=pos.entry_price)
+                        pos.be_triggered = True
+                        pos.current_sl   = pos.entry_price
+                        if self._channel and pos.position_id:
+                            asyncio.ensure_future(
+                                self._channel.update_tp1(pos.position_id, price)
+                            )
 
-            self._positions = remaining
+                # ── Advanced Trailing Stop ───────────────────────────────
+                pnl = self._calc_pnl(pos, price)
+                if pnl >= TRAILING_PROFIT_THRESHOLD:
+                    if not pos.trailing_active:
+                        pos.trailing_active = True
+                        logger.info(
+                            f"[TRAIL] Trailing activated on {pos.cl_ord_id_live} | "
+                            f"profit=${pnl:.2f} (threshold=${TRAILING_PROFIT_THRESHOLD})"
+                        )
 
-    async def _fire_break_even(self, pos: ActivePosition):
-        """Send SL modification to move both accounts to break-even."""
+                    trail_sl = self._trail_sl(pos, price)
+                    if trail_sl is not None and self._sl_improved(pos, trail_sl):
+                        logger.info(
+                            f"[TRAIL] SL updated: {pos.current_sl:.2f} → {trail_sl:.2f} | "
+                            f"price={price} pos={pos.cl_ord_id_live}"
+                        )
+                        await self._modify_sl(pos, new_sl=trail_sl)
+                        pos.current_sl = trail_sl
+                        if self._channel and pos.position_id:
+                            asyncio.ensure_future(
+                                self._channel.update_trailing(pos.position_id, trail_sl)
+                            )
+
+                still_open.append(pos)
+
+            self._positions = still_open
+
+    # ── Helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _calc_pnl(pos: ActivePosition, price: float) -> float:
+        """P&L in USD for the position at current price."""
+        if pos.signal_type == "BUY":
+            return (price - pos.entry_price) * pos.lot_size * 100.0
+        else:
+            return (pos.entry_price - price) * pos.lot_size * 100.0
+
+    @staticmethod
+    def _trail_sl(pos: ActivePosition, price: float) -> Optional[float]:
+        """Calculate the new trailing SL level."""
+        if pos.signal_type == "BUY":
+            return round(price - TRAILING_STOP_USD, 2)
+        else:
+            return round(price + TRAILING_STOP_USD, 2)
+
+    @staticmethod
+    def _sl_improved(pos: ActivePosition, new_sl: float) -> bool:
+        """Returns True if the new SL is better (tighter) than the current one."""
+        if pos.signal_type == "BUY":
+            return new_sl > pos.current_sl
+        else:
+            return new_sl < pos.current_sl
+
+    async def _modify_sl(self, pos: ActivePosition, new_sl: float):
+        """Send SL modification to both accounts simultaneously."""
         modification = {
-            "action":       "MODIFY_SL",
-            "signal_type":  pos.signal_type,
-            "entry_price":  pos.entry_price,
-            "stop_loss":    pos.entry_price,   # New SL = entry (zero risk)
-            "take_profit":  pos.tp1,
-            "lot_size":     0.0,               # Not used for modification
+            "action":         "MODIFY_SL",
+            "signal_type":    pos.signal_type,
+            "entry_price":    pos.entry_price,
+            "stop_loss":      new_sl,
+            "take_profit":    pos.tp1,
+            "lot_size":       pos.lot_size,
             "cl_ord_id_live": pos.cl_ord_id_live,
             "cl_ord_id_demo": pos.cl_ord_id_demo,
         }
         try:
             await self.fix_executor.modify_position_sl(modification)
-            logger.info(
-                f"[BE] Break-even fired | LIVE={pos.cl_ord_id_live} | "
-                f"DEMO={pos.cl_ord_id_demo} | New SL={pos.entry_price}"
-            )
         except Exception as e:
-            logger.error(f"[BE] Break-even modification failed: {e}", exc_info=True)
+            logger.error(f"[BE] SL modification failed: {e}", exc_info=True)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -683,13 +766,58 @@ class TelegramListener:
             session = SESSION_NAME
             logger.info("Telegram: using file session (Mode B — interactive)")
 
-        self.client       = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-        self.signal_queue = signal_queue
-        self.news_queue   = news_queue
-        self.market_feed  = market_feed
-        self.be_monitor   = be_monitor
-        self._dedup       = DeduplicationCache()
-        self._running     = False
+        self.client           = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        self.signal_queue     = signal_queue
+        self.news_queue       = news_queue
+        self.market_feed      = market_feed
+        self.be_monitor       = be_monitor
+        self._dedup           = DeduplicationCache()
+        self._running         = False
+        self._signal_chats:   List[int] = []
+        self._news_chats:     List[int] = []
+
+    async def _resolve_dynamic_folders(self):
+        """
+        Use GetDialogFiltersRequest to auto-discover Signal and News chats from
+        Telegram folder names. Falls back to SIGNALS_FOLDER_ID / NEWS_FOLDER_ID
+        if the folder names don't match or the API call fails.
+        """
+        try:
+            filters = await self.client(GetDialogFiltersRequest())
+            for f in filters.filters:
+                title = getattr(f, 'title', '').lower()
+                peers = getattr(f, 'include_peers', [])
+                chat_ids = []
+                for p in peers:
+                    if hasattr(p, 'channel_id'):
+                        chat_ids.append(p.channel_id)
+                    elif hasattr(p, 'chat_id'):
+                        chat_ids.append(p.chat_id)
+                    elif hasattr(p, 'user_id'):
+                        chat_ids.append(p.user_id)
+
+                if any(kw in title for kw in ('signal', 'gold', 'trade', 'xau')):
+                    self._signal_chats.extend(chat_ids)
+                    logger.info(f"[FOLDERS] Signals folder '{f.title}' → chats: {chat_ids}")
+                elif any(kw in title for kw in ('news', 'economic', 'calendar')):
+                    self._news_chats.extend(chat_ids)
+                    logger.info(f"[FOLDERS] News folder '{f.title}' → chats: {chat_ids}")
+
+        except Exception as e:
+            logger.warning(f"[FOLDERS] GetDialogFiltersRequest failed: {e} — using env var IDs")
+
+        # Fallback: use env var IDs if dynamic resolution found nothing
+        if not self._signal_chats and SIGNALS_FOLDER_ID:
+            self._signal_chats = [SIGNALS_FOLDER_ID]
+            logger.info(f"[FOLDERS] Signals: using env var ID {SIGNALS_FOLDER_ID}")
+        if not self._news_chats and NEWS_FOLDER_ID:
+            self._news_chats = [NEWS_FOLDER_ID]
+            logger.info(f"[FOLDERS] News: using env var ID {NEWS_FOLDER_ID}")
+
+        if not self._signal_chats:
+            logger.warning("[FOLDERS] No signal chats resolved — set SIGNALS_FOLDER_ID or create a folder named 'Signals'")
+        if not self._news_chats:
+            logger.warning("[FOLDERS] No news chats resolved — set NEWS_FOLDER_ID or create a folder named 'News'")
 
     async def start(self):
         if TELEGRAM_STRING_SESSION:
@@ -700,21 +828,14 @@ class TelegramListener:
         me = await self.client.get_me()
         logger.info(f"Authenticated as: {me.first_name} (@{getattr(me, 'username', 'N/A')})")
 
-        for folder_id, label in [(SIGNALS_FOLDER_ID, "Signals"), (NEWS_FOLDER_ID, "News")]:
-            if not folder_id:
-                logger.warning(f"{label} folder ID not configured — skipping")
-                continue
-            try:
-                await self.client.get_entity(folder_id)
-                logger.info(f"{label} folder ({folder_id}): accessible ✓")
-            except Exception as e:
-                logger.warning(
-                    f"Cannot access {label} folder {folder_id}: {e} "
-                    f"— listener will start but may not receive messages from this chat"
-                )
+        # Resolve folders dynamically (with env var fallback)
+        await self._resolve_dynamic_folders()
 
     def register_handlers(self):
-        @self.client.on(events.NewMessage(chats=SIGNALS_FOLDER_ID))
+        signal_chats = self._signal_chats if self._signal_chats else None
+        news_chats   = self._news_chats   if self._news_chats   else None
+
+        @self.client.on(events.NewMessage(chats=signal_chats))
         async def handle_signal(event):
             msg  = event.message
             text = msg.message or ""
@@ -757,7 +878,7 @@ class TelegramListener:
                 f"Confidence={signal.confidence_score}"
             )
 
-        @self.client.on(events.NewMessage(chats=NEWS_FOLDER_ID))
+        @self.client.on(events.NewMessage(chats=news_chats))
         async def handle_news(event):
             text = event.message.message or ""
             if text:
