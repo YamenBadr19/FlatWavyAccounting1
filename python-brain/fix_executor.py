@@ -140,22 +140,32 @@ class AsyncFIXSession:
     # ── Connection ─────────────────────────────────────
 
     async def connect(self):
-        ssl_ctx = ssl.create_default_context() if self.use_ssl else None
+        if not self.host:
+            raise ValueError(f"[{self.account_name}] FIX host is not configured — set the FIX_LIVE_HOST / FIX_DEMO_HOST secret")
+
+        if self.use_ssl:
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+        else:
+            ssl_ctx = None
+
         try:
-            self._reader, self._writer = await asyncio.open_connection(
-                self.host, self.port, ssl=ssl_ctx
+            connect_coro = asyncio.open_connection(
+                self.host, self.port, ssl=ssl_ctx,
+                server_hostname=self.host if self.use_ssl else None,
             )
+            self._reader, self._writer = await asyncio.wait_for(connect_coro, timeout=15)
             logger.info(
                 f"[{self.account_name}] TCP connected → {self.host}:{self.port} "
                 f"({'TLS' if self.use_ssl else 'plain'})"
             )
-        except ssl.SSLError as e:
+        except (ssl.SSLError, asyncio.TimeoutError) as e:
             logger.warning(
-                f"[{self.account_name}] SSL failed ({e}), retrying without SSL"
+                f"[{self.account_name}] SSL/timeout failed ({e}), retrying plain TCP"
             )
-            self._reader, self._writer = await asyncio.open_connection(
-                self.host, self.port
-            )
+            connect_coro = asyncio.open_connection(self.host, self.port)
+            self._reader, self._writer = await asyncio.wait_for(connect_coro, timeout=10)
             logger.info(f"[{self.account_name}] TCP connected (plain fallback) → {self.host}:{self.port}")
         await self._send_logon()
 
