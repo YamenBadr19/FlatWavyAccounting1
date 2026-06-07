@@ -5,9 +5,9 @@ Separate bot (BotFather token) from the userbot.
 Requires: CONTROL_BOT_TOKEN, optionally CONTROL_BOT_CHAT_ID.
 
 Commands:
-  /start    — Resume signal processing (clear pause flag)
-  /stop     — Pause signal processing (FIX stays connected)
-  /status   — Live system health: FIX sessions, price, balance, mode
+  /start    — Resume signal processing
+  /stop     — Pause signal processing (MCP stays connected)
+  /status   — Live system health: MCP connection, price, balance, mode
   /balance  — Current equity, free margin, risk settings, data source
 """
 
@@ -35,7 +35,7 @@ class ControlBot:
         market_feed     = None,
     ):
         self._balance_mgr  = balance_manager
-        self._fix_executor = fix_executor
+        self._executor     = fix_executor   # MCPExecutor (kept as fix_executor for compat)
         self._news_feed    = news_feed
         self._market_feed  = market_feed
         self._paused       = False
@@ -63,7 +63,7 @@ class ControlBot:
             )
             return
 
-        me = self   # closure capture
+        me = self
 
         def _authorized(update: Update) -> bool:
             if not CONTROL_BOT_CHAT_ID:
@@ -88,7 +88,7 @@ class ControlBot:
             me._paused = True
             await update.message.reply_text(
                 "⏸ *Gold Blueprint* — Signal processing **PAUSED**\n"
-                "_FIX sessions remain connected. Send /start to resume._",
+                "_MCP connection remains active. Send /start to resume._",
                 parse_mode="Markdown"
             )
             logger.info(f"[CTRL] /stop by {update.effective_user.username}")
@@ -96,22 +96,22 @@ class ControlBot:
         async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not _authorized(update):
                 return
-            fix_stats  = me._fix_executor.stats() if me._fix_executor else {}
+            exec_stats = me._executor.stats() if me._executor else {}
             bal        = me._balance_mgr.status()  if me._balance_mgr  else {}
             snap       = me._market_feed.snapshot  if me._market_feed   else None
             price_line = f"`{snap.current_price:.2f}`" if (snap and snap.current_price > 0) else "N/A"
-            live_ok    = "✅" if fix_stats.get("live_logged_in") else "❌"
-            demo_ok    = "✅" if fix_stats.get("demo_logged_in") else "❌"
+            mcp_ok     = "✅" if exec_stats.get("mcp_connected") else "❌"
             mode       = "⏸ PAUSED" if me._paused else "✅ ACTIVE"
             text = (
                 f"*Gold Blueprint — Live Status*\n"
                 f"{'━'*30}\n"
                 f"🔁 Processing: {mode}\n"
-                f"🔌 FIX LIVE: {live_ok}   DEMO: {demo_ok}\n"
+                f"🔌 MCP (cTrader): {mcp_ok}\n"
                 f"💛 XAUUSD: {price_line}\n"
                 f"💰 Equity: `${bal.get('equity', 0):,.2f}`  ({bal.get('source','?')})\n"
-                f"📊 Executed: {fix_stats.get('executed', 0)}  "
-                f"Rejected: {fix_stats.get('rejected', 0)}\n"
+                f"📊 Executed: {exec_stats.get('executed', 0)}  "
+                f"Rejected: {exec_stats.get('rejected', 0)}\n"
+                f"📂 Open tracked: {exec_stats.get('open_positions', 0)}\n"
                 f"{'━'*30}"
             )
             await update.message.reply_text(text, parse_mode="Markdown")
@@ -128,7 +128,7 @@ class ControlBot:
                 f"📊 Risk/trade:   `{bs.get('risk_pct', 1.0)}%`\n"
                 f"📦 Lot range:    `{bs.get('min_lot',0.01)} – {bs.get('max_lot',0.05)}`\n"
                 f"🔗 Data source:  `{bs.get('source', 'DEFAULT')}`\n"
-                f"🌐 MCP:          {'✅ Live' if bs.get('mcp_connected') else '⚠️ Offline (cloud fallback)'}"
+                f"🌐 MCP:          {'✅ Live' if bs.get('mcp_connected') else '⚠️ Offline (using default equity)'}"
             )
             await update.message.reply_text(text, parse_mode="Markdown")
 

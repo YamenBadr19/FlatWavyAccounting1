@@ -6,15 +6,15 @@ Full Stack Entry Point
 Signal flow:
   Telegram → [signal_queue] → MarketAnalyzer (5 filters + dynamic lot size)
            → [validated_queue] → ExecutionBridge (TTL check + audit)
-           → DualAccountFIXExecutor.execute_signal()
-           → asyncio.gather(LIVE FIX, DEMO FIX)   ← simultaneous
+           → MCPExecutor.execute_signal()
+           → cTrader Local MCP Server (http://127.0.0.1:9876/mcp/)
 
 Coroutines running in parallel (11 total):
   1.  MarketDataFeed.run_forever()          yfinance Gold data, 60s
   2.  ForexNewsFeed.run_forever()           ForexFactory calendar, 5 min
   3.  TelegramListener.run_with_reconnect() Telegram userbot
   4.  MarketAnalyzer.run()                  5-filter pipeline
-  5.  DualAccountFIXExecutor.run_forever()  LIVE + DEMO FIX sessions
+  5.  MCPExecutor.run_forever()             MCP keepalive + health check
   6.  ExecutionBridge.relay_loop()          Execution relay + audit
   7.  BreakEvenMonitor.run_forever()        Tier1/2 SL + trailing stop
   8.  BalanceManager.run_forever()          MCP balance polling (30s)
@@ -45,7 +45,7 @@ from market_data_feed  import MarketDataFeed
 from news_feed         import ForexNewsFeed
 from telegram_listener import TelegramListener, BreakEvenMonitor
 from market_analyzer   import MarketAnalyzer
-from fix_executor      import DualAccountFIXExecutor
+from fix_executor      import MCPExecutor
 from signal_queue      import ExecutionBridge
 from balance_manager   import BalanceManager
 from channel_reporter  import ChannelReporter
@@ -102,14 +102,14 @@ async def main():
     balance_manager = BalanceManager()
     channel_reporter = ChannelReporter()
 
-    fix_executor = DualAccountFIXExecutor(
+    mcp_executor = MCPExecutor(
         balance_manager  = balance_manager,
         channel_reporter = channel_reporter,
     )
 
     be_monitor = BreakEvenMonitor(
         market_feed      = market_feed,
-        fix_executor     = fix_executor,
+        fix_executor     = mcp_executor,
         channel_reporter = channel_reporter,
     )
 
@@ -121,7 +121,6 @@ async def main():
     )
 
     # Wire the shared Telegram client into channel reporter
-    # (Client object exists at construction; connection happens at listener.start())
     channel_reporter.set_client(listener.client)
 
     analyzer = MarketAnalyzer(
@@ -133,13 +132,13 @@ async def main():
 
     bridge = ExecutionBridge(
         validated_queue  = validated_queue,
-        fix_executor     = fix_executor,
+        fix_executor     = mcp_executor,
         channel_reporter = channel_reporter,
     )
 
     control_bot = ControlBot(
         balance_manager = balance_manager,
-        fix_executor    = fix_executor,
+        fix_executor    = mcp_executor,
         news_feed       = news_feed,
         market_feed     = market_feed,
     )
@@ -149,10 +148,11 @@ async def main():
     logger.info("  Python Brain — Fully Autonomous Production Stack")
     logger.info("=" * 65)
     logger.info("  Coroutines: MarketData | NewsCalendar | Telegram")
-    logger.info("             5-Filter Analyzer | FIX LIVE+DEMO (SSL)")
+    logger.info("             5-Filter Analyzer | MCP Executor")
     logger.info("             ExecutionBridge | Tier1/2+Trail SL Mgr")
     logger.info("             BalanceManager (MCP) | ControlBot")
     logger.info("             ChannelReporter | Heartbeat")
+    logger.info(f"  Broker:    cTrader MCP @ http://127.0.0.1:9876/mcp/")
     logger.info("=" * 65)
 
     try:
@@ -161,7 +161,7 @@ async def main():
             news_feed.run_forever(),                         # 2.  ForexFactory calendar
             listener.run_with_reconnect(),                   # 3.  Telegram userbot
             analyzer.run(),                                  # 4.  5-filter pipeline
-            fix_executor.run_forever(),                      # 5.  FIX LIVE + DEMO
+            mcp_executor.run_forever(),                      # 5.  MCP keepalive
             bridge.relay_loop(),                             # 6.  Execution relay
             be_monitor.run_forever(),                        # 7.  Tier1/2 + trailing SL
             balance_manager.run_forever(),                   # 8.  MCP balance polling

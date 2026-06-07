@@ -6,7 +6,7 @@ of every system component — no imports from the brain required.
 
 Data sources (all local — zero network calls except news check):
   /tmp/gold_blueprint_heartbeat  → brain liveness + age
-  gold_blueprint.log             → FIX session status, last market data
+  gold_blueprint.log             → MCP connection status, last market data
   watchdog.log                   → restart count
   signal_audit.jsonl             → last 5 executed signals
   ForexFactory JSON endpoint     → current news mode (live check)
@@ -43,7 +43,7 @@ AUDIT_LOG        = ROOT / "signal_audit.jsonl"
 FF_URL           = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 XAUUSD_TICKER    = "GC=F"
 HEARTBEAT_STALE  = 120   # seconds before brain considered hung
-LOG_SCAN_LINES   = 300   # how many tail lines to parse for FIX/market state
+LOG_SCAN_LINES   = 300   # how many tail lines to parse for MCP/market state
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ANSI COLOURS (no external deps)
@@ -164,45 +164,59 @@ def collect_watchdog_info() -> dict:
     }
 
 
-def collect_fix_status() -> dict:
+def collect_mcp_status() -> dict:
     """
-    Parse gold_blueprint.log to find the most recent login/logout event
-    for LIVE and DEMO FIX sessions.
+    Parse gold_blueprint.log to find the most recent MCP connection events.
+    Looks for MCPExecutor health-check lines.
     """
     lines = _tail(BRAIN_LOG, LOG_SCAN_LINES)
     result = {
-        "live": {"logged_in": False, "last_event": None, "last_event_age": None},
-        "demo": {"logged_in": False, "last_event": None, "last_event_age": None},
+        "connected":    False,
+        "last_event":   None,
+        "last_event_age": None,
+        "executed":     0,
+        "rejected":     0,
+        "open_tracked": 0,
     }
 
     for line in reversed(lines):
-        for acct in ("live", "demo"):
-            if result[acct]["last_event"] is not None:
-                continue
-            tag = f"[{acct.upper()}]"
-            if tag not in line.upper():
-                continue
+        # MCP keepalive log: "[MCP] ✓ Connected | Executed=N | Rejected=N | Open positions tracked=N"
+        if "[MCP]" not in line:
+            continue
 
-            if "Logged in ✓" in line or "Logon confirmed" in line:
-                result[acct]["logged_in"] = True
-            elif "Logout" in line or "Disconnected" in line:
-                result[acct]["logged_in"] = False
+        if result["last_event"] is None:
+            if "✓ Connected" in line:
+                result["connected"] = True
+            elif "✗ cTrader MCP server unreachable" in line:
+                result["connected"] = False
             else:
                 continue
 
-            # Parse timestamp
             m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
             if m:
                 try:
                     event_ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
                     event_ts = event_ts.replace(tzinfo=timezone.utc)
-                    age = (datetime.now(timezone.utc) - event_ts).total_seconds()
-                    result[acct]["last_event"]     = event_ts
-                    result[acct]["last_event_age"] = age
+                    result["last_event"]     = event_ts
+                    result["last_event_age"] = (datetime.now(timezone.utc) - event_ts).total_seconds()
                 except ValueError:
                     pass
 
+            # Parse counters from the connected line
+            em = re.search(r"Executed=(\d+)", line)
+            rm = re.search(r"Rejected=(\d+)", line)
+            om = re.search(r"tracked=(\d+)", line)
+            if em: result["executed"]     = int(em.group(1))
+            if rm: result["rejected"]     = int(rm.group(1))
+            if om: result["open_tracked"] = int(om.group(1))
+            break
+
     return result
+
+
+def collect_fix_status() -> dict:
+    """Backward-compat shim — delegates to collect_mcp_status."""
+    return collect_mcp_status()
 
 
 def collect_market_data_from_log() -> dict:
@@ -433,19 +447,23 @@ def render(
         _row("EMA(50):",    ema_label),
     ]
 
-    # ── Section 3: FIX sessions ───────────────────────────
-    def _fix_row(name: str, data: dict) -> str:
-        logged = data.get("logged_in", False)
-        evt_age = data.get("last_event_age")
-        age_note = _dim(f"  (last event {_age_str(evt_age)})") if evt_age else ""
-        status = (_ok("● LOGGED IN") + age_note) if logged else _err("○ OFFLINE / NOT YET CONNECTED")
-        return _row(f"{name}:", status)
+    # ── Section 3: MCP connection ─────────────────────────
+    mcp_connected = fix.get("connected", False)
+    mcp_age       = fix.get("last_event_age")
+    mcp_executed  = fix.get("executed", 0)
+    mcp_rejected  = fix.get("rejected", 0)
+    mcp_open      = fix.get("open_tracked", 0)
+    age_note      = _dim(f"  (last ping {_age_str(mcp_age)})") if mcp_age else _dim("  (no events yet)")
+    mcp_status    = (_ok("● CONNECTED") + age_note) if mcp_connected else _err("○ OFFLINE — open cTrader with MCP enabled")
 
     lines += [
-        _header("FIX SESSIONS"),
+        _header("MCP BROKER  (cTrader Local MCP)", "LIVE" if mcp_connected else "OFFLINE", G if mcp_connected else R),
         _rule(),
-        _fix_row("LIVE", fix.get("live", {})),
-        _fix_row("DEMO", fix.get("demo", {})),
+        _row("cTrader MCP:",   mcp_status),
+        _row("Endpoint:",      _dim("http://127.0.0.1:9876/mcp/")),
+        _row("Executed:",      _ok(str(mcp_executed)) if mcp_executed else _dim("0")),
+        _row("Rejected:",      _warn(str(mcp_rejected)) if mcp_rejected else _dim("0")),
+        _row("Open tracked:",  _dim(str(mcp_open))),
     ]
 
     # ── Section 4: News mode ──────────────────────────────

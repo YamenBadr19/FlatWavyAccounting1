@@ -1,530 +1,376 @@
 """
-fix_executor.py — Dual-Account FIX 4.4 Execution Engine
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Two simultaneous FIX 4.4 Trade sessions: Live + Demo.
+fix_executor.py — MCP Execution Engine (cTrader Local MCP Server)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Replaces the old FIX 4.4 TCP sessions entirely.
+All broker communication now goes through the local cTrader MCP server
+running at http://127.0.0.1:9876/mcp/
 
-execute_signal()        — fires both accounts via asyncio.gather()
-modify_position_sl()    — fires SL modification on both accounts
-                          (used by BreakEvenMonitor)
+Public interface (unchanged — drop-in replacement for DualAccountFIXExecutor):
+  execute_signal(validated_signal)   → dict with result
+  modify_position_sl(modification)   → dict with result
+  run_forever()                      → keepalive / health-check loop
+  stats()                            → dict
 
-Architecture:
-  AsyncFIXSession         — one persistent FIX TCP connection
-  DualAccountFIXExecutor  — two AsyncFIXSession instances
-
-Credentials (set in Replit Secrets):
-  FIX_LIVE_HOST, FIX_LIVE_TRADE_PORT
-  FIX_LIVE_SENDER_COMP_ID, FIX_LIVE_TARGET_COMP_ID
-  FIX_LIVE_SENDER_SUB_ID, FIX_LIVE_PASSWORD
-
-  FIX_DEMO_HOST, FIX_DEMO_TRADE_PORT
-  FIX_DEMO_SENDER_COMP_ID, FIX_DEMO_TARGET_COMP_ID
-  FIX_DEMO_SENDER_SUB_ID, FIX_DEMO_PASSWORD
+MCP tool calls used:
+  tools/list          — discover available tools on startup
+  open_position       — enter a trade (symbolName, tradeType, volume, stopLoss, takeProfit)
+  modify_position     — modify SL/TP on an open position
+  close_position      — close by positionId
+  get_positions       — list open positions
+  get_account_info    — equity / free margin (also used by BalanceManager)
 """
 
 import asyncio
+import json
 import logging
 import os
-import ssl
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Callable, Dict
+from typing import Optional, Dict, Any
 
-logger = logging.getLogger('fix_executor')
+import aiohttp
 
-SOH              = b'\x01'
-FIX_VERSION      = "FIX.4.4"
-HEARTBEAT_INT    = 30
-RECONNECT_BASE   = 5.0
+logger = logging.getLogger('mcp_executor')
 
-# FIX MsgType values
-MSG_LOGON        = "A"
-MSG_LOGOUT       = "5"
-MSG_HEARTBEAT    = "0"
-MSG_TEST_REQUEST = "1"
-MSG_NEW_ORDER    = "D"
-MSG_CANCEL_REPLACE = "G"   # OrderCancelReplaceRequest — used for SL modification
-MSG_EXEC_REPORT  = "8"
+MCP_URL          = os.environ.get("MCP_URL", "http://127.0.0.1:9876/mcp/").strip()
+MCP_TIMEOUT      = float(os.environ.get("MCP_TIMEOUT_SECS", "8"))
+HEALTH_INTERVAL  = 30.0    # seconds between health pings
+_JSON_RPC_ID     = 0
 
-SIDE_BUY         = "1"
-SIDE_SELL        = "2"
-ORD_TYPE_MARKET  = "1"
-ORD_TYPE_LIMIT   = "2"
+
+def _next_id() -> int:
+    global _JSON_RPC_ID
+    _JSON_RPC_ID += 1
+    return _JSON_RPC_ID
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# FIX MESSAGE BUILDER
+# LOW-LEVEL MCP CLIENT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class FIXMessage:
-    def __init__(self, msg_type: str):
-        self._fields: list = []
-        self.append(35, msg_type)
+class MCPClient:
+    """Thin async wrapper around the cTrader MCP JSON-RPC HTTP endpoint."""
 
-    def append(self, tag: int, value) -> 'FIXMessage':
-        self._fields.append((tag, str(value)))
-        return self
+    def __init__(self, url: str = MCP_URL):
+        self.url = url
+        self._connected   = False
+        self._last_ok     = 0.0
+        self._tools: list = []
 
-    def encode(self, sender: str, target: str, seq_num: int, sub_id: str = "") -> bytes:
-        header_pairs = [
-            (49, sender),
-            (56, target),
-            (34, str(seq_num)),
-            (52, datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S.%f")[:-3]),
-        ]
-        if sub_id:
-            header_pairs.append((50, sub_id))
+    @property
+    def connected(self) -> bool:
+        return self._connected and (time.monotonic() - self._last_ok) < 90
 
-        header = b"".join(f"{t}={v}".encode() + SOH for t, v in header_pairs)
-        body   = b"".join(f"{t}={v}".encode() + SOH for t, v in self._fields)
-        full_body = header + body
-        body_len  = len(full_body)
+    async def call(self, tool: str, arguments: dict = None) -> Any:
+        """
+        Call a tool via JSON-RPC tools/call.
+        Returns the parsed result content (list of blocks or raw dict).
+        Raises on HTTP error or JSON-RPC error.
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "method":  "tools/call",
+            "params":  {"name": tool, "arguments": arguments or {}},
+            "id":      _next_id(),
+        }
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                self.url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=MCP_TIMEOUT),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
 
-        prefix   = f"8={FIX_VERSION}".encode() + SOH + f"9={body_len}".encode() + SOH
-        full     = prefix + full_body
-        checksum = sum(full) % 256
-        full    += f"10={checksum:03d}".encode() + SOH
-        return full
+        if "error" in data:
+            raise RuntimeError(f"MCP error: {data['error']}")
 
-    @staticmethod
-    def parse(raw: bytes) -> Dict[int, str]:
-        result = {}
-        for pair in raw.split(SOH):
-            if b'=' in pair:
-                tag, _, value = pair.partition(b'=')
+        result  = data.get("result", {})
+        content = result.get("content", [])
+
+        # Parse first text block if present
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
                 try:
-                    result[int(tag)] = value.decode(errors='replace')
-                except ValueError:
-                    pass
+                    return json.loads(block["text"])
+                except (json.JSONDecodeError, TypeError):
+                    return block["text"]
+
         return result
 
+    async def list_tools(self) -> list:
+        """Discover available MCP tools and cache them."""
+        payload = {"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": _next_id()}
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(
+                self.url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=MCP_TIMEOUT),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+        self._tools = data.get("result", {}).get("tools", [])
+        return self._tools
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ASYNC FIX SESSION
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class AsyncFIXSession:
-    def __init__(
-        self,
-        account_name:      str,
-        host:              str,
-        port:              int,
-        sender_comp_id:    str,
-        target_comp_id:    str,
-        sender_sub_id:     str,
-        password:          str,
-        on_exec_report:    Optional[Callable] = None,
-        on_balance_update: Optional[Callable] = None,
-        use_ssl:           bool = True,
-    ):
-        self.account_name      = account_name
-        self.host              = host
-        self.port              = port
-        self.sender            = sender_comp_id
-        self.target            = target_comp_id
-        self.sub_id            = sender_sub_id
-        self.password          = password
-        self.on_exec_report    = on_exec_report
-        self.on_balance_update = on_balance_update
-        self.use_ssl           = use_ssl
-
-        self._seq             = 1
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
-        self._logged_in       = False
-        self._running         = False
-        self._reconnect_delay = RECONNECT_BASE
-        self._orders: Dict[str, dict] = {}   # clOrdId → signal dict
-
-        logger.info(f"[{account_name}] FIX session configured ({host}:{port}) SSL={'ON' if use_ssl else 'OFF'}")
-
-    # ── Connection ─────────────────────────────────────
-
-    async def connect(self):
-        if not self.host:
-            raise ValueError(f"[{self.account_name}] FIX host is not configured — set the FIX_LIVE_HOST / FIX_DEMO_HOST secret")
-
-        if self.use_ssl:
-            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-        else:
-            ssl_ctx = None
-
+    async def ping(self) -> bool:
+        """Quick liveness check via get_account_info."""
         try:
-            connect_coro = asyncio.open_connection(
-                self.host, self.port, ssl=ssl_ctx,
-                server_hostname=self.host if self.use_ssl else None,
-            )
-            self._reader, self._writer = await asyncio.wait_for(connect_coro, timeout=15)
-            logger.info(
-                f"[{self.account_name}] TCP connected → {self.host}:{self.port} "
-                f"({'TLS' if self.use_ssl else 'plain'})"
-            )
-        except (ssl.SSLError, asyncio.TimeoutError) as e:
-            logger.warning(
-                f"[{self.account_name}] SSL/timeout failed ({e}), retrying plain TCP"
-            )
-            connect_coro = asyncio.open_connection(self.host, self.port)
-            self._reader, self._writer = await asyncio.wait_for(connect_coro, timeout=10)
-            logger.info(f"[{self.account_name}] TCP connected (plain fallback) → {self.host}:{self.port}")
-        await self._send_logon()
-
-    async def _send_logon(self):
-        msg = FIXMessage(MSG_LOGON)
-        msg.append(98,  0)
-        msg.append(108, HEARTBEAT_INT)
-        msg.append(141, "Y")
-        msg.append(554, self.password)
-        await self._send(msg)
-        logger.info(f"[{self.account_name}] Logon sent")
-
-    async def disconnect(self):
-        self._running   = False
-        self._logged_in = False
-        if self._writer:
-            try:
-                msg = FIXMessage(MSG_LOGOUT)
-                msg.append(58, "Normal")
-                await self._send(msg)
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
-
-    # ── Send ───────────────────────────────────────────
-
-    async def _send(self, msg: FIXMessage):
-        if not self._writer or self._writer.is_closing():
-            raise ConnectionError(f"[{self.account_name}] Writer unavailable")
-        raw = msg.encode(self.sender, self.target, self._seq, self.sub_id)
-        self._seq += 1
-        self._writer.write(raw)
-        await self._writer.drain()
-
-    # ── Order execution ────────────────────────────────
-
-    async def send_order(self, signal_dict: dict) -> Optional[str]:
-        if not self._logged_in:
-            logger.error(f"[{self.account_name}] Not logged in — order skipped")
-            return None
-
-        direction = signal_dict['signal_type']
-        entry     = float(signal_dict['entry_price'])
-        sl        = float(signal_dict['stop_loss'])
-        tp        = float(signal_dict['take_profit'])
-        lots      = float(signal_dict['lot_size'])
-        cl_id     = f"GB-{uuid.uuid4().hex[:12].upper()}"
-        side      = SIDE_BUY if direction == "BUY" else SIDE_SELL
-
-        msg = FIXMessage(MSG_NEW_ORDER)
-        msg.append(11, cl_id)
-        msg.append(55, "XAUUSD")
-        msg.append(54, side)
-        msg.append(60, datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S"))
-        msg.append(38, lots)
-        msg.append(40, ORD_TYPE_MARKET)
-        msg.append(44, entry)
-        msg.append(99, sl)
-        msg.append(9001, sl)     # cTrader SL tag
-        msg.append(9002, tp)     # cTrader TP tag
-
-        try:
-            await self._send(msg)
-            self._orders[cl_id] = signal_dict
-            logger.info(
-                f"[{self.account_name}] ORDER SENT | {direction} {lots}L @ {entry} "
-                f"SL={sl} TP={tp} | ClOrdID={cl_id}"
-            )
-            return cl_id
-        except Exception as e:
-            logger.error(f"[{self.account_name}] Order send failed: {e}")
-            return None
-
-    async def modify_sl(self, orig_cl_ord_id: str, signal_dict: dict, new_sl: float) -> Optional[str]:
-        """
-        Send OrderCancelReplaceRequest (35=G) to move SL to new_sl.
-        Used by BreakEvenMonitor to set SL = entry price.
-        """
-        if not self._logged_in:
-            logger.error(f"[{self.account_name}] Not logged in — SL modification skipped")
-            return None
-
-        direction = signal_dict['signal_type']
-        entry     = float(signal_dict['entry_price'])
-        tp        = float(signal_dict['take_profit'])
-        lots      = float(signal_dict.get('lot_size', 0.01))
-        new_cl_id = f"BE-{uuid.uuid4().hex[:12].upper()}"
-        side      = SIDE_BUY if direction == "BUY" else SIDE_SELL
-
-        msg = FIXMessage(MSG_CANCEL_REPLACE)
-        msg.append(11,  new_cl_id)        # New ClOrdID
-        msg.append(41,  orig_cl_ord_id)   # OrigClOrdID
-        msg.append(55,  "XAUUSD")
-        msg.append(54,  side)
-        msg.append(60,  datetime.now(timezone.utc).strftime("%Y%m%d-%H:%M:%S"))
-        msg.append(38,  lots)
-        msg.append(40,  ORD_TYPE_MARKET)
-        msg.append(44,  entry)
-        msg.append(99,  new_sl)
-        msg.append(9001, new_sl)
-        msg.append(9002, tp)
-
-        try:
-            await self._send(msg)
-            logger.info(
-                f"[{self.account_name}] SL MODIFIED | OrigID={orig_cl_ord_id} "
-                f"NewSL={new_sl} (break-even) | NewID={new_cl_id}"
-            )
-            return new_cl_id
-        except Exception as e:
-            logger.error(f"[{self.account_name}] SL modification failed: {e}")
-            return None
-
-    # ── Reader loop ────────────────────────────────────
-
-    async def _read_messages(self):
-        buffer = b""
-        while self._running and self._reader:
-            try:
-                chunk = await asyncio.wait_for(self._reader.read(4096), timeout=HEARTBEAT_INT + 5)
-                if not chunk:
-                    break
-                buffer += chunk
-                while b"10=" in buffer:
-                    end = buffer.find(b"10=")
-                    cs_end = buffer.find(SOH, end)
-                    if cs_end == -1:
-                        break
-                    await self._dispatch(buffer[:cs_end + 1])
-                    buffer = buffer[cs_end + 1:]
-            except asyncio.TimeoutError:
-                hb = FIXMessage(MSG_HEARTBEAT)
-                try:
-                    await self._send(hb)
-                except Exception:
-                    break
-            except Exception as e:
-                logger.error(f"[{self.account_name}] Read error: {e}")
-                break
-
-    async def _dispatch(self, raw: bytes):
-        tags = FIXMessage.parse(raw)
-        mt   = tags.get(35, "")
-
-        if mt == MSG_LOGON:
-            self._logged_in       = True
-            self._reconnect_delay = RECONNECT_BASE
-            logger.info(f"[{self.account_name}] Logged in ✓")
-            # Some brokers send balance tags on logon
-            self._maybe_update_balance(tags)
-
-        elif mt == MSG_LOGOUT:
-            self._logged_in = False
-            reason = tags.get(58, "")
-            logger.warning(f"[{self.account_name}] Logout received | Tag58={reason!r}")
-
-        elif mt == "3":   # Session-level Reject
-            ref_msg  = tags.get(372, "?")
-            tag_ref  = tags.get(371, "?")
-            reason   = tags.get(58,  "No reason given")
-            logger.error(
-                f"[{self.account_name}] LOGON REJECTED | "
-                f"Reason (Tag58): {reason!r} | "
-                f"RefMsgType={ref_msg} | RefTagID={tag_ref} | "
-                f"Full payload: {dict(tags)}"
-            )
-
-        elif mt == MSG_TEST_REQUEST:
-            hb = FIXMessage(MSG_HEARTBEAT)
-            hb.append(112, tags.get(112, ""))
-            await self._send(hb)
-
-        elif mt == MSG_EXEC_REPORT:
-            ord_status  = tags.get(39, "")
-            cl_id       = tags.get(11, "")
-            avg_px      = tags.get(31, "N/A")
-            position_id = tags.get(37, tags.get(721, ""))   # Tag 37=OrderID, 721=PosMaintRptID
-            status_map  = {
-                "0": "New", "1": "Partial", "2": "Filled",
-                "8": "Rejected", "4": "Cancelled",
-            }
-            label = status_map.get(ord_status, ord_status)
-            if ord_status == "8":
-                reject_reason = tags.get(58, "")
-                logger.error(
-                    f"[{self.account_name}] ORDER REJECTED | ClOrdID={cl_id} | "
-                    f"Reason (Tag58): {reject_reason!r} | Full: {dict(tags)}"
-                )
-            else:
-                logger.info(
-                    f"[{self.account_name}] ExecReport {label} | "
-                    f"ClOrdID={cl_id} @ {avg_px} | PositionID={position_id}"
-                )
-            self._maybe_update_balance(tags)
-            if self.on_exec_report:
-                await self.on_exec_report(self.account_name, tags)
-            self._orders.pop(cl_id, None)
-
-    def _maybe_update_balance(self, tags: dict):
-        """Parse equity/free-margin balance tags if present and fire callback."""
-        # Tag 9003/9004 are common cTrader custom tags for balance/equity
-        equity      = tags.get(9003) or tags.get(9011)
-        free_margin = tags.get(9004) or tags.get(9012)
-        if equity:
-            try:
-                eq = float(equity)
-                fm = float(free_margin) if free_margin else eq
-                if self.on_balance_update:
-                    asyncio.ensure_future(self.on_balance_update(eq, fm))
-                logger.debug(f"[{self.account_name}] Balance tags: equity={eq} free_margin={fm}")
-            except (ValueError, TypeError):
-                pass
-
-    # ── Reconnect loop ─────────────────────────────────
-
-    async def run_forever(self):
-        self._running = True
-        while self._running:
-            try:
-                await self.connect()
-                await self._read_messages()
-            except ConnectionRefusedError:
-                logger.error(f"[{self.account_name}] Connection refused ({self.host}:{self.port})")
-            except OSError as e:
-                logger.error(f"[{self.account_name}] Network: {e}")
-            except Exception as e:
-                logger.error(f"[{self.account_name}] Error: {e}", exc_info=True)
-
-            if self._running:
-                self._logged_in = False
-                logger.info(f"[{self.account_name}] Reconnect in {self._reconnect_delay:.0f}s")
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 120)
+            await self.call("get_account_info")
+            self._connected = True
+            self._last_ok   = time.monotonic()
+            return True
+        except Exception:
+            self._connected = False
+            return False
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# DUAL-ACCOUNT EXECUTOR
+# MCP EXECUTOR  (drop-in for DualAccountFIXExecutor)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-class DualAccountFIXExecutor:
+class MCPExecutor:
     """
-    Manages Live + Demo FIX sessions in parallel.
-    execute_signal()    — simultaneous order on both accounts
-    modify_position_sl() — simultaneous SL modification on both accounts
+    Executes trades via the cTrader Local MCP Server.
+    Exposes the same public interface as the old DualAccountFIXExecutor
+    so no other module needs to change its call sites.
     """
 
     def __init__(self, balance_manager=None, channel_reporter=None):
-        def e(k, d=""): return os.environ.get(k, d).strip()
-        use_ssl = os.environ.get("FIX_USE_SSL", "true").lower() != "false"
+        self._client        = MCPClient(MCP_URL)
+        self._balance_mgr   = balance_manager
+        self._channel       = channel_reporter
+        self._executed      = 0
+        self._rejected      = 0
+        self._running       = False
 
-        self._balance_mgr    = balance_manager
-        self._channel        = channel_reporter
-        self._executed       = 0
-        self._rejected       = 0
+        # Maps label → positionId so BreakEvenMonitor can modify/close
+        self._positions: Dict[str, str] = {}
 
-        self.live_session = AsyncFIXSession(
-            "LIVE",
-            e("FIX_LIVE_HOST"),
-            int(e("FIX_LIVE_TRADE_PORT", "5202")),
-            e("FIX_LIVE_SENDER_COMP_ID"),
-            e("FIX_LIVE_TARGET_COMP_ID"),
-            e("FIX_LIVE_SENDER_SUB_ID"),
-            e("FIX_LIVE_PASSWORD"),
-            on_exec_report    = self._on_exec,
-            on_balance_update = self._on_balance,
-            use_ssl           = use_ssl,
-        )
-        self.demo_session = AsyncFIXSession(
-            "DEMO",
-            e("FIX_DEMO_HOST"),
-            int(e("FIX_DEMO_TRADE_PORT", "5212")),
-            e("FIX_DEMO_SENDER_COMP_ID"),
-            e("FIX_DEMO_TARGET_COMP_ID"),
-            e("FIX_DEMO_SENDER_SUB_ID"),
-            e("FIX_DEMO_PASSWORD"),
-            on_exec_report    = self._on_exec,
-            on_balance_update = self._on_balance,
-            use_ssl           = use_ssl,
-        )
-        logger.info("DualAccountFIXExecutor initialized (LIVE + DEMO)")
+        logger.info(f"MCPExecutor ready | MCP endpoint: {MCP_URL}")
 
-    async def _on_exec(self, account: str, tags: dict):
-        ord_status  = tags.get(39, "")
-        cl_id       = tags.get(11, "")
-        position_id = tags.get(37, tags.get(721, ""))
-        if ord_status == "8":
-            self._rejected += 1
-        elif ord_status in ("1", "2"):
-            self._executed += 1
-            if position_id and cl_id and self._channel:
-                self._channel.register_position_id(cl_id, position_id)
+    # ── Internal MCP helpers ────────────────────────────
 
-    async def _on_balance(self, equity: float, free_margin: float):
-        if self._balance_mgr:
-            self._balance_mgr.update_from_fix(equity, free_margin)
+    async def _open_position(
+        self,
+        symbol:    str,
+        direction: str,
+        volume:    float,
+        sl:        float,
+        tp:        float,
+        label:     str,
+    ) -> Optional[str]:
+        """
+        Call open_position MCP tool.
+        Returns the positionId string on success, None on failure.
+        """
+        args = {
+            "symbolName": symbol,
+            "tradeType":  direction.upper(),
+            "volume":     volume,
+            "stopLoss":   sl,
+            "takeProfit": tp,
+            "label":      label,
+        }
+        try:
+            result = await self._client.call("open_position", args)
+            pos_id = None
+            if isinstance(result, dict):
+                pos_id = str(
+                    result.get("positionId") or
+                    result.get("position_id") or
+                    result.get("id") or ""
+                )
+            elif isinstance(result, str):
+                pos_id = result.strip()
+
+            if pos_id:
+                self._positions[label] = pos_id
+                self._client._connected = True
+                self._client._last_ok   = time.monotonic()
+                logger.info(
+                    f"[MCP] OPENED {direction} {volume}L XAUUSD @ market | "
+                    f"SL={sl} TP={tp} | positionId={pos_id} | label={label}"
+                )
+            else:
+                logger.warning(f"[MCP] open_position returned no positionId | raw={result!r}")
+            return pos_id
+
+        except Exception as e:
+            logger.error(f"[MCP] open_position failed: {e}")
+            return None
+
+    async def _modify_position(
+        self,
+        position_id: str,
+        new_sl:      float,
+        new_tp:      float,
+    ) -> bool:
+        """Call modify_position MCP tool. Returns True on success."""
+        args = {
+            "positionId": position_id,
+            "stopLoss":   new_sl,
+            "takeProfit": new_tp,
+        }
+        try:
+            await self._client.call("modify_position", args)
+            logger.info(
+                f"[MCP] MODIFIED positionId={position_id} | "
+                f"newSL={new_sl} | newTP={new_tp}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[MCP] modify_position failed: {e}")
+            return False
+
+    async def _close_position(self, position_id: str) -> bool:
+        """Call close_position MCP tool. Returns True on success."""
+        try:
+            await self._client.call("close_position", {"positionId": position_id})
+            logger.info(f"[MCP] CLOSED positionId={position_id}")
+            return True
+        except Exception as e:
+            logger.error(f"[MCP] close_position failed: {e}")
+            return False
+
+    # ── Public interface (same as old DualAccountFIXExecutor) ───
 
     async def execute_signal(self, validated_signal) -> Dict:
-        """Fire LIVE + DEMO simultaneously. Returns {live: clOrdId, demo: clOrdId}."""
-        sd = validated_signal.to_dict() if hasattr(validated_signal, 'to_dict') else validated_signal
+        """
+        Open a position via MCP. Returns a result dict.
+        The 'live' key carries the positionId for BreakEvenMonitor.
+        """
+        sd = (
+            validated_signal.to_dict()
+            if hasattr(validated_signal, 'to_dict')
+            else validated_signal
+        )
+
+        direction = sd['signal_type']
+        entry     = float(sd['entry_price'])
+        sl        = float(sd['stop_loss'])
+        tp        = float(sd['take_profit'])
+        lots      = float(sd['lot_size'])
+        label     = f"GB-{uuid.uuid4().hex[:10].upper()}"
 
         logger.info(
-            f"[DUAL EXEC] {sd['signal_type']} XAUUSD @ {sd['entry_price']} | "
-            f"Lot={sd['lot_size']} | SL={sd['stop_loss']} | TP={sd['take_profit']}"
+            f"[MCP EXEC] {direction} XAUUSD @ {entry} | "
+            f"Lot={lots} | SL={sl} | TP={tp} | label={label}"
         )
 
-        live_id, demo_id = await asyncio.gather(
-            self.live_session.send_order(sd),
-            self.demo_session.send_order(sd),
-            return_exceptions=True,
+        pos_id = await self._open_position(
+            symbol    = "XAUUSD",
+            direction = direction,
+            volume    = lots,
+            sl        = sl,
+            tp        = tp,
+            label     = label,
         )
 
-        results = {
-            "live": str(live_id) if not isinstance(live_id, Exception) else f"ERR:{live_id}",
-            "demo": str(demo_id) if not isinstance(demo_id, Exception) else f"ERR:{demo_id}",
-        }
-        logger.info(f"[DUAL EXEC] Results → LIVE={results['live']} | DEMO={results['demo']}")
-        return results
+        if pos_id:
+            self._executed += 1
+            result = {"mcp": pos_id, "live": pos_id, "demo": "MCP"}
+            if self._channel:
+                asyncio.ensure_future(
+                    self._channel.report_signal(
+                        signal_dict = sd,
+                        cl_ord_id   = pos_id,
+                        source      = "SIGNALS",
+                    )
+                )
+        else:
+            self._rejected += 1
+            result = {"mcp": "FAILED", "live": "FAILED", "demo": "MCP"}
+
+        logger.info(f"[MCP EXEC] Result → {result}")
+        return result
 
     async def modify_position_sl(self, modification: dict) -> Dict:
         """
-        Move SL to break-even on both accounts simultaneously.
-        modification dict must contain:
-          cl_ord_id_live, cl_ord_id_demo, signal_type, entry_price,
-          stop_loss (new SL value), take_profit, lot_size
+        Modify the SL of an open position (used by BreakEvenMonitor).
+        Accepts a modification dict with either:
+          - positionId   — direct MCP position ID
+          - cl_ord_id_live — label used at open (used to look up positionId)
         """
-        new_sl         = float(modification['stop_loss'])
-        live_orig_id   = modification.get('cl_ord_id_live', '')
-        demo_orig_id   = modification.get('cl_ord_id_demo', '')
+        new_sl = float(modification['stop_loss'])
+        new_tp = float(modification.get('take_profit', 0))
+
+        # Resolve position ID
+        pos_id = modification.get('positionId', '')
+        if not pos_id:
+            label  = modification.get('cl_ord_id_live', '')
+            pos_id = self._positions.get(label, '')
+
+        if not pos_id:
+            logger.warning(
+                f"[MCP BE] Cannot modify — no positionId found. "
+                f"modification={modification}"
+            )
+            return {"mcp": "NO_POSITION_ID", "live": "NO_POSITION_ID", "demo": "MCP"}
 
         logger.info(
-            f"[BE MODIFY] Moving SL to {new_sl} (break-even) | "
-            f"LIVE={live_orig_id} | DEMO={demo_orig_id}"
+            f"[MCP BE] Moving SL → {new_sl} | positionId={pos_id}"
         )
 
-        live_result, demo_result = await asyncio.gather(
-            self.live_session.modify_sl(live_orig_id, modification, new_sl),
-            self.demo_session.modify_sl(demo_orig_id, modification, new_sl),
-            return_exceptions=True,
-        )
+        ok = await self._modify_position(pos_id, new_sl=new_sl, new_tp=new_tp)
+        status = pos_id if ok else "FAILED"
+        return {"mcp": status, "live": status, "demo": "MCP"}
 
-        results = {
-            "live": str(live_result) if not isinstance(live_result, Exception) else f"ERR:{live_result}",
-            "demo": str(demo_result) if not isinstance(demo_result, Exception) else f"ERR:{demo_result}",
-        }
-        logger.info(f"[BE MODIFY] Results → LIVE={results['live']} | DEMO={results['demo']}")
-        return results
+    async def close_position_by_label(self, label: str) -> bool:
+        """Close a position by its label (used externally if needed)."""
+        pos_id = self._positions.get(label, '')
+        if not pos_id:
+            logger.warning(f"[MCP] close_position_by_label: no positionId for label={label!r}")
+            return False
+        return await self._close_position(pos_id)
+
+    def register_position_id(self, label: str, position_id: str):
+        """Allow ChannelReporter or other components to register a position ID."""
+        self._positions[label] = position_id
+        logger.debug(f"[MCP] Registered label={label} → positionId={position_id}")
 
     async def run_forever(self):
-        logger.info("Starting FIX sessions (LIVE + DEMO)")
-        await asyncio.gather(
-            self.live_session.run_forever(),
-            self.demo_session.run_forever(),
-        )
+        """
+        Keepalive loop: pings the MCP server every HEALTH_INTERVAL seconds,
+        logs the connection status, and discovers available tools on startup.
+        """
+        self._running = True
+
+        # Startup: discover tools
+        logger.info(f"[MCP] Connecting to cTrader MCP server at {MCP_URL}")
+        try:
+            tools = await self._client.list_tools()
+            names = [t.get('name', '?') for t in tools]
+            logger.info(f"[MCP] Available tools ({len(names)}): {names}")
+        except Exception as e:
+            logger.warning(f"[MCP] tools/list failed — cTrader may not be running yet: {e}")
+
+        # Health ping loop
+        while self._running:
+            ok = await self._client.ping()
+            if ok:
+                logger.info(
+                    f"[MCP] ✓ Connected | "
+                    f"Executed={self._executed} | Rejected={self._rejected} | "
+                    f"Open positions tracked={len(self._positions)}"
+                )
+            else:
+                logger.warning(
+                    f"[MCP] ✗ cTrader MCP server unreachable ({MCP_URL}) — "
+                    f"is cTrader running with MCP enabled on port 9876?"
+                )
+            await asyncio.sleep(HEALTH_INTERVAL)
 
     def stats(self) -> dict:
         return {
             "executed":       self._executed,
             "rejected":       self._rejected,
-            "live_logged_in": self.live_session._logged_in,
-            "demo_logged_in": self.demo_session._logged_in,
+            "mcp_connected":  self._client.connected,
+            "live_logged_in": self._client.connected,
+            "demo_logged_in": False,
+            "open_positions": len(self._positions),
         }
+
+
+# Backward-compat alias — code that imports DualAccountFIXExecutor still works
+DualAccountFIXExecutor = MCPExecutor

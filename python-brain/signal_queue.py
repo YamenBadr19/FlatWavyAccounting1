@@ -170,22 +170,20 @@ class SignalBridge:
 class ExecutionBridge:
     """
     Drains ValidatedSignal objects from validated_queue and fires them
-    directly through DualAccountFIXExecutor (LIVE + DEMO simultaneously).
-
-    Replaces SignalBridge's cBot HTTP/file relay — no cBot required.
+    directly through MCPExecutor (cTrader Local MCP Server).
     """
 
     def __init__(self, validated_queue: asyncio.Queue, fix_executor, channel_reporter=None):
         self.validated_queue  = validated_queue
-        self.fix_executor     = fix_executor
+        self.fix_executor     = fix_executor   # MCPExecutor instance
         self._channel         = channel_reporter
         self._exec_count      = 0
         self._block_count     = 0
         self._error_count     = 0
-        logger.info("ExecutionBridge ready (FIX direct mode)")
+        logger.info("ExecutionBridge ready (MCP mode)")
 
     async def relay_loop(self):
-        """Continuously drain validated signals and execute via FIX."""
+        """Continuously drain validated signals and execute via MCP."""
         logger.info("ExecutionBridge relay loop started")
         while True:
             validated = await self.validated_queue.get()
@@ -213,30 +211,30 @@ class ExecutionBridge:
                 except Exception as e:
                     logger.warning(f"TTL check failed: {e}")
 
-                # Fire through FIX executor (LIVE + DEMO simultaneously)
+                # Fire through MCP executor
                 try:
                     result = await self.fix_executor.execute_signal(validated)
                     self._exec_count += 1
                     self._append_audit(signal_dict, status="executed", extra=result)
                     logger.info(
-                        f"[FIX] Executed {signal_dict.get('signal_type','?')} @ "
+                        f"[MCP] Executed {signal_dict.get('signal_type','?')} @ "
                         f"{signal_dict.get('entry_price','?')} | "
                         f"Lot={signal_dict.get('lot_size','?')} | Result={result}"
                     )
                     # Log signal to private channel (non-blocking)
                     if self._channel:
-                        cl_ord_id = result.get("live", "") if isinstance(result, dict) else ""
+                        pos_id = result.get("mcp", result.get("live", "")) if isinstance(result, dict) else ""
                         asyncio.ensure_future(
                             self._channel.report_signal(
                                 signal_dict = signal_dict,
-                                cl_ord_id   = cl_ord_id,
+                                cl_ord_id   = pos_id,
                                 source      = "SIGNALS",
                             )
                         )
                 except Exception as e:
                     self._error_count += 1
                     self._append_audit(signal_dict, status="execution_error", extra={"error": str(e)})
-                    logger.error(f"[FIX] Execution error: {e}", exc_info=True)
+                    logger.error(f"[MCP] Execution error: {e}", exc_info=True)
 
             except Exception as e:
                 logger.error(f"ExecutionBridge loop error: {e}", exc_info=True)

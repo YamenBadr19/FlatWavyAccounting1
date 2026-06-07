@@ -1,8 +1,8 @@
 """
 BalanceManager — Fully Autonomous Balance & Risk Management
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Fetches live Equity + Free Margin from cTrader via local MCP server.
-Falls back to FIX-session-tracked balance or configured default equity.
+Fetches live Equity + Free Margin from cTrader via the local MCP server.
+Falls back to DEFAULT_ACCOUNT_EQUITY env var when MCP is unreachable.
 Calculates lot sizes automatically — zero manual configuration required.
 
 Lot size formula (XAUUSD):
@@ -21,8 +21,7 @@ Example (equity=$10,000, risk=1%, SL=$15 away):
 
 MCP server priority:
   1. http://127.0.0.1:9876/mcp/  (local cTrader, polled every 30s)
-  2. FIX execution report balance tags
-  3. DEFAULT_ACCOUNT_EQUITY env var (safe fallback, default $10,000)
+  2. DEFAULT_ACCOUNT_EQUITY env var (safe fallback, default $10,000)
 """
 
 import asyncio
@@ -54,9 +53,7 @@ MCP_STALE_SECS     = 120.0
 class BalanceManager:
     """
     Single source of truth for account balance and risk-based lot sizing.
-
-    Thread-safe: designed for asyncio, all mutations are lock-free
-    (single event loop guarantees sequential access).
+    Data source: cTrader MCP server → DEFAULT_ACCOUNT_EQUITY fallback.
     """
 
     def __init__(self):
@@ -64,7 +61,6 @@ class BalanceManager:
         self._free_margin = DEFAULT_EQUITY
         self._source      = "DEFAULT"
         self._mcp_last_ok = 0.0
-        self._fix_equity  = None
 
         logger.info(
             f"BalanceManager ready | Default equity=${DEFAULT_EQUITY:,.2f} | "
@@ -73,26 +69,14 @@ class BalanceManager:
 
     # ── Balance update APIs ────────────────────────────────────────
 
-    def update_from_fix(self, equity: float, free_margin: float):
-        """Called by FIX session on account-summary/execution-report with balance tags."""
-        self._fix_equity = equity
-        if not self._mcp_connected():
-            self._equity      = equity
-            self._free_margin = free_margin
-            self._source      = "FIX"
-            logger.info(
-                f"[FIX] Balance updated → equity=${equity:,.2f}  "
-                f"free_margin=${free_margin:,.2f}"
-            )
-
     async def fetch_from_mcp(self) -> bool:
         """
         POST to local cTrader MCP server and parse equity/freeMargin.
-        Succeeds only when the brain runs locally or via a reverse tunnel.
-        Silent failure is expected and safe in cloud mode.
+        Silent failure is safe — falls back to DEFAULT_ACCOUNT_EQUITY.
         """
         try:
             import aiohttp
+            import json as _json
             payload = {
                 "jsonrpc": "2.0",
                 "method":  "tools/call",
@@ -103,16 +87,15 @@ class BalanceManager:
                 async with sess.post(
                     MCP_URL,
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=3.0),
+                    timeout=aiohttp.ClientTimeout(total=5.0),
                 ) as resp:
                     if resp.status != 200:
                         return False
-                    data    = await resp.json()
+                    data    = await resp.json(content_type=None)
                     result  = data.get("result", {})
                     content = result.get("content", [])
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "text":
-                            import json as _json
                             info    = _json.loads(block["text"])
                             equity  = float(info.get("equity", 0))
                             margin  = float(
@@ -131,11 +114,11 @@ class BalanceManager:
                                 )
                                 return True
         except Exception as e:
-            logger.debug(f"[MCP] Unavailable ({type(e).__name__}): {e}")
+            logger.debug(f"[MCP] Balance unavailable ({type(e).__name__}): {e}")
         return False
 
     async def run_forever(self):
-        """Background coroutine: poll MCP every 30 s; gracefully degrades in cloud mode."""
+        """Background coroutine: poll MCP every 30s; gracefully degrades when offline."""
         logger.info(f"BalanceManager polling MCP every {MCP_POLL_SECS:.0f}s ({MCP_URL})")
         while True:
             await self.fetch_from_mcp()
@@ -173,7 +156,6 @@ class BalanceManager:
         risk_usd = self._equity * RISK_PER_TRADE_PCT / 100.0
         raw_lot  = risk_usd / (sl_distance * 100.0)
 
-        # Apply confluence ceiling
         conf_ceiling_map = {0: MIN_LOT, 1: 0.02, 2: 0.03, 3: MAX_LOT}
         ceiling = conf_ceiling_map.get(min(confluence_level, 3), MAX_LOT)
 
