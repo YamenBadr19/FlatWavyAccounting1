@@ -51,6 +51,11 @@ from balance_manager   import BalanceManager
 from channel_reporter  import ChannelReporter
 from control_bot       import ControlBot
 
+# استخدم cTrader Open API مباشرة إذا كان ACCESS_TOKEN موجوداً
+_USE_OPEN_API = bool(os.environ.get("CTRADER_ACCESS_TOKEN", "").strip())
+if _USE_OPEN_API:
+    from ctrader_api import CTraderOpenAPI
+
 # Heartbeat file — watchdog checks this to detect hung brain
 HEARTBEAT_FILE     = Path("/tmp/gold_blueprint_heartbeat")
 HEARTBEAT_INTERVAL = 30   # seconds
@@ -102,10 +107,15 @@ async def main():
     balance_manager = BalanceManager()
     channel_reporter = ChannelReporter()
 
-    mcp_executor = MCPExecutor(
-        balance_manager  = balance_manager,
-        channel_reporter = channel_reporter,
-    )
+    if _USE_OPEN_API:
+        mcp_executor = CTraderOpenAPI(balance_manager=balance_manager)
+        logger.info("  Executor:  cTrader Open API (مباشر — بدون ngrok)")
+    else:
+        mcp_executor = MCPExecutor(
+            balance_manager  = balance_manager,
+            channel_reporter = channel_reporter,
+        )
+        logger.info("  Executor:  MCP Local Server")
 
     be_monitor = BreakEvenMonitor(
         market_feed      = market_feed,
@@ -143,16 +153,17 @@ async def main():
         market_feed     = market_feed,
     )
 
+    broker_label = "cTrader Open API → demo.ctraderapi.com:5035" if _USE_OPEN_API else "cTrader MCP @ http://127.0.0.1:9876/mcp/"
     logger.info("=" * 65)
     logger.info("  GOLD BLUEPRINT TRADING SYSTEM v3.0")
     logger.info("  Python Brain — Fully Autonomous Production Stack")
     logger.info("=" * 65)
     logger.info("  Coroutines: MarketData | NewsCalendar | Telegram")
-    logger.info("             5-Filter Analyzer | MCP Executor")
+    logger.info("             5-Filter Analyzer | Open API Executor")
     logger.info("             ExecutionBridge | Tier1/2+Trail SL Mgr")
-    logger.info("             BalanceManager (MCP) | ControlBot")
-    logger.info("             ChannelReporter | Heartbeat")
-    logger.info(f"  Broker:    cTrader MCP @ http://127.0.0.1:9876/mcp/")
+    logger.info("             BalanceManager | ControlBot | Heartbeat")
+    logger.info(f"  Broker:    {broker_label}")
+    logger.info(f"  Account:   {os.environ.get('CTRADER_ACCOUNT_ID','?')} (Demo)")
     logger.info("=" * 65)
 
     try:
