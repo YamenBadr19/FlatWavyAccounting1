@@ -117,6 +117,15 @@ class BalanceManager:
             logger.debug(f"[MCP] Balance unavailable ({type(e).__name__}): {e}")
         return False
 
+    def update_from_open_api(self, balance: float, free_margin: float = 0.0):
+        """Called by CTraderOpenAPI whenever a fresh balance arrives."""
+        if balance > 0:
+            self._equity      = balance
+            self._free_margin = free_margin if free_margin > 0 else balance
+            self._source      = "cTrader Open API"
+            self._mcp_last_ok = time.monotonic()
+            logger.info(f"[OpenAPI] Balance → equity=${balance:,.2f}  free_margin=${self._free_margin:,.2f}")
+
     async def run_forever(self):
         """Background coroutine: poll MCP every 30s; gracefully degrades when offline."""
         logger.info(f"BalanceManager polling MCP every {MCP_POLL_SECS:.0f}s ({MCP_URL})")
