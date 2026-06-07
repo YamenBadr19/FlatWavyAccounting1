@@ -135,9 +135,7 @@ class ControlBot:
 
         async def cmd_positions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             """
-            Query get_positions from the cTrader MCP server and render
-            each open position with direction, volume, entry, current P&L,
-            and current SL/TP.
+            Query get_positions from cTrader Open API (or MCP fallback).
             """
             if not _authorized(update):
                 return
@@ -149,22 +147,13 @@ class ControlBot:
             await update.message.reply_text("🔄 Fetching open positions from cTrader…")
 
             try:
-                raw = await me._executor._client.call("get_positions")
+                positions = await me._executor.get_positions()
             except Exception as e:
                 await update.message.reply_text(
-                    f"❌ *MCP Error*: `{e}`\n\n"
-                    "_Is cTrader open with Local MCP enabled on port 9876?_",
+                    f"❌ *Error*: `{e}`",
                     parse_mode="Markdown",
                 )
                 return
-
-            # Normalise: MCP may return a list directly or wrap it
-            if isinstance(raw, dict):
-                positions = raw.get("positions", raw.get("data", [raw]))
-            elif isinstance(raw, list):
-                positions = raw
-            else:
-                positions = []
 
             if not positions:
                 snap  = me._market_feed.snapshot if me._market_feed else None
