@@ -1,203 +1,152 @@
 """
-BalanceManager — Fully Autonomous Balance & Risk Management
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Fetches live Equity + Free Margin from cTrader via the local MCP server.
-Falls back to DEFAULT_ACCOUNT_EQUITY env var when MCP is unreachable.
-Calculates lot sizes automatically — zero manual configuration required.
+balance_manager.py — Account Balance & Equity Manager
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Monitors account balance, equity, and margin.
+Prevents opening trades if:
+  ✗ Balance is 0 or negative
+  ✗ Free margin is insufficient
+  ✗ Used margin > max allowed
 
-Lot size formula (XAUUSD):
-  risk_usd  = equity × RISK_PER_TRADE_PCT / 100
-  lot_size  = risk_usd / (sl_distance_usd × 100)
-
-XAUUSD math:
-  1 standard lot = 100 troy oz
-  $1 price move  = $100 P&L per standard lot
-  $1 price move  = $1   P&L per 0.01 lot (micro)
-  → lot_size = risk_usd / (sl_distance_usd × 100)
-
-Example (equity=$10,000, risk=1%, SL=$15 away):
-  risk_usd = 10,000 × 0.01 = $100
-  lot_size = 100 / (15 × 100) = 0.067 → capped at 0.05
-
-MCP server priority:
-  1. http://127.0.0.1:9876/mcp/  (local cTrader, polled every 30s)
-  2. DEFAULT_ACCOUNT_EQUITY env var (safe fallback, default $10,000)
+USAGE:
+  from balance_manager import BalanceManager
+  bm = BalanceManager()
+  await bm.run_forever()
 """
 
 import asyncio
 import logging
-import math
-import os
-import time
+from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Optional
 
-logger = logging.getLogger('balance_mgr')
+logger = logging.getLogger('balance_manager')
 
-
-def _ef(k, d):
-    try:
-        return float(os.environ.get(k, str(d)))
-    except (ValueError, TypeError):
-        return float(d)
+MIN_REQUIRED_BALANCE = 100.0  # USD
+MAX_USED_MARGIN_PERCENT = 80.0  # %
+UPDATE_INTERVAL = 30.0  # seconds
 
 
-MCP_URL            = os.environ.get("MCP_URL", "http://127.0.0.1:9876/mcp/").strip()
-DEFAULT_EQUITY     = _ef("DEFAULT_ACCOUNT_EQUITY", 10_000.0)
-RISK_PER_TRADE_PCT = _ef("RISK_PER_TRADE_PCT", 1.0)
-MAX_LOT            = _ef("MAX_LOT_SIZE", 0.05)
-MIN_LOT            = _ef("MIN_LOT_SIZE", 0.01)
-LOT_STEP           = 0.01
-MCP_POLL_SECS      = 30.0
-MCP_STALE_SECS     = 120.0
+@dataclass
+class BalanceState:
+    """Current account balance state."""
+    balance: float  # Account balance
+    equity: float   # Balance + unrealized P&L
+    free_margin: float  # Available to use
+    used_margin: float  # Already used
+    used_margin_percent: float  # 0-100%
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now(timezone.utc)
+
+    def is_healthy(self) -> bool:
+        """Check if account is in good state."""
+        return (
+            self.balance > MIN_REQUIRED_BALANCE and
+            self.used_margin_percent < MAX_USED_MARGIN_PERCENT and
+            self.free_margin > 0
+        )
 
 
 class BalanceManager:
     """
-    Single source of truth for account balance and risk-based lot sizing.
-    Data source: cTrader MCP server → DEFAULT_ACCOUNT_EQUITY fallback.
+    Manages account balance and determines if trading is allowed.
     """
 
     def __init__(self):
-        self._equity      = DEFAULT_EQUITY
-        self._free_margin = DEFAULT_EQUITY
-        self._source      = "DEFAULT"
-        self._mcp_last_ok = 0.0
+        self._state: Optional[BalanceState] = None
+        self._running = False
+        self._can_trade = False
+        logger.info("BalanceManager initialized")
 
-        logger.info(
-            f"BalanceManager ready | Default equity=${DEFAULT_EQUITY:,.2f} | "
-            f"Risk={RISK_PER_TRADE_PCT}% per trade | Lot range=[{MIN_LOT},{MAX_LOT}]"
+    async def update_from_api(self, balance: float, equity: float):
+        """
+        Update balance and equity from broker API.
+        Called by CTraderOpenAPI.
+        """
+        used_margin = balance - (equity - balance)  # Rough approximation
+        used_margin_percent = (
+            (used_margin / balance * 100) if balance > 0 else 0
         )
 
-    # ── Balance update APIs ────────────────────────────────────────
+        self._state = BalanceState(
+            balance=balance,
+            equity=equity,
+            free_margin=balance - used_margin,
+            used_margin=max(0, used_margin),
+            used_margin_percent=max(0, used_margin_percent),
+        )
 
-    async def fetch_from_mcp(self) -> bool:
-        """
-        POST to local cTrader MCP server and parse equity/freeMargin.
-        Silent failure is safe — falls back to DEFAULT_ACCOUNT_EQUITY.
-        """
-        try:
-            import aiohttp
-            import json as _json
-            payload = {
-                "jsonrpc": "2.0",
-                "method":  "tools/call",
-                "params":  {"name": "get_account_info", "arguments": {}},
-                "id":      1,
-            }
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(
-                    MCP_URL,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=5.0),
-                ) as resp:
-                    if resp.status != 200:
-                        return False
-                    data    = await resp.json(content_type=None)
-                    result  = data.get("result", {})
-                    content = result.get("content", [])
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            info    = _json.loads(block["text"])
-                            equity  = float(info.get("equity", 0))
-                            margin  = float(
-                                info.get("freeMargin",
-                                info.get("free_margin",
-                                info.get("freemargin", 0)))
-                            )
-                            if equity > 0:
-                                self._equity      = equity
-                                self._free_margin = margin
-                                self._source      = "MCP"
-                                self._mcp_last_ok = time.monotonic()
-                                logger.info(
-                                    f"[MCP] Balance → equity=${equity:,.2f}  "
-                                    f"free_margin=${margin:,.2f}"
-                                )
-                                return True
-        except Exception as e:
-            logger.debug(f"[MCP] Balance unavailable ({type(e).__name__}): {e}")
-        return False
+        self._can_trade = self._state.is_healthy()
+        logger.debug(
+            f"Balance update: ${balance:.2f} | "
+            f"Equity: ${equity:.2f} | "
+            f"Used margin: {used_margin_percent:.1f}% | "
+            f"Can trade: {self._can_trade}"
+        )
 
-    def update_from_open_api(self, balance: float, free_margin: float = 0.0):
-        """Called by CTraderOpenAPI whenever a fresh balance arrives."""
-        if balance > 0:
-            self._equity      = balance
-            self._free_margin = free_margin if free_margin > 0 else balance
-            self._source      = "cTrader Open API"
-            self._mcp_last_ok = time.monotonic()
-            logger.info(f"[OpenAPI] Balance → equity=${balance:,.2f}  free_margin=${self._free_margin:,.2f}")
+    def can_trade(self) -> bool:
+        """
+        Check if trading is allowed.
+        """
+        return self._can_trade and self._state is not None
+
+    def get_state(self) -> Optional[BalanceState]:
+        """
+        Get current balance state.
+        """
+        return self._state
+
+    def get_max_lot_size(self, risk_percent: float = 1.0) -> float:
+        """
+        Calculate maximum allowed lot size based on risk management.
+        
+        Args:
+            risk_percent: Maximum % of balance to risk per trade (default 1%)
+        
+        Returns:
+            Maximum lot size
+        """
+        if not self._state or self._state.balance <= 0:
+            return 0.0
+
+        # Risk = Balance × risk_percent / 100
+        risk_amount = self._state.balance * (risk_percent / 100.0)
+        # Lot size = risk_amount / pips (simplified: 10 pips stop loss)
+        max_lot = risk_amount / (10 * 0.01)  # 10 pips
+
+        return max(0.01, min(max_lot, 10.0))  # Cap at 10.0 lots
 
     async def run_forever(self):
-        """Background coroutine: poll MCP every 30s; gracefully degrades when offline."""
-        logger.info(f"BalanceManager polling MCP every {MCP_POLL_SECS:.0f}s ({MCP_URL})")
-        while True:
-            await self.fetch_from_mcp()
-            await asyncio.sleep(MCP_POLL_SECS)
-
-    # ── Lot size calculation ───────────────────────────────────────
-
-    def calculate_lot_size(
-        self,
-        entry_price:      float,
-        stop_loss:        float,
-        confluence_level: int  = 3,
-        news_mode:        bool = False,
-    ) -> float:
         """
-        Autonomously calculate lot size from live balance + SL distance.
-
-        news_mode = True  →  always MIN_LOT (capital preservation, non-negotiable)
-        Otherwise         →  RISK_PER_TRADE_PCT of equity, bounded to [MIN_LOT, MAX_LOT]
-
-        The confluence_level acts as a CEILING on the calculated lot:
-            0  → MIN_LOT cap
-            1  → 0.02 cap
-            2  → 0.03 cap
-            3  → MAX_LOT cap (full risk allowed)
+        Periodically log balance status.
         """
-        if news_mode:
-            return MIN_LOT
+        self._running = True
+        logger.info("BalanceManager monitoring started")
 
-        sl_distance = abs(entry_price - stop_loss)
-        if sl_distance < 0.01:
-            logger.warning(f"SL distance too small ({sl_distance:.4f}) — using MIN_LOT")
-            return MIN_LOT
+        while self._running:
+            try:
+                if self._state:
+                    status = "✓ HEALTHY" if self._can_trade else "✗ INSUFFICIENT"
+                    logger.info(
+                        f"Balance: ${self._state.balance:.2f} | "
+                        f"Equity: ${self._state.equity:.2f} | "
+                        f"Used margin: {self._state.used_margin_percent:.1f}% | "
+                        f"Status: {status}"
+                    )
+                else:
+                    logger.warning("No balance data available")
 
-        risk_usd = self._equity * RISK_PER_TRADE_PCT / 100.0
-        raw_lot  = risk_usd / (sl_distance * 100.0)
+                await asyncio.sleep(UPDATE_INTERVAL)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"BalanceManager error: {e}")
+                await asyncio.sleep(10)
 
-        conf_ceiling_map = {0: MIN_LOT, 1: 0.02, 2: 0.03, 3: MAX_LOT}
-        ceiling = conf_ceiling_map.get(min(confluence_level, 3), MAX_LOT)
+        logger.info("BalanceManager stopped")
 
-        lot = math.floor(raw_lot / LOT_STEP) * LOT_STEP
-        lot = round(max(MIN_LOT, min(ceiling, lot)), 2)
-
-        logger.debug(
-            f"Lot calc: equity=${self._equity:,.0f}  risk={RISK_PER_TRADE_PCT}%  "
-            f"sl_dist={sl_distance:.2f}  raw={raw_lot:.4f}  "
-            f"conf_ceil={ceiling}  → {lot}"
-        )
-        return lot
-
-    # ── Status ─────────────────────────────────────────────────────
-
-    def _mcp_connected(self) -> bool:
-        return (time.monotonic() - self._mcp_last_ok) < MCP_STALE_SECS
-
-    @property
-    def equity(self) -> float:
-        return self._equity
-
-    @property
-    def free_margin(self) -> float:
-        return self._free_margin
-
-    def status(self) -> dict:
-        return {
-            "equity":        round(self._equity, 2),
-            "free_margin":   round(self._free_margin, 2),
-            "risk_pct":      RISK_PER_TRADE_PCT,
-            "max_lot":       MAX_LOT,
-            "min_lot":       MIN_LOT,
-            "mcp_connected": self._mcp_connected(),
-            "source":        self._source,
-        }
+    async def stop(self):
+        """Stop monitoring."""
+        self._running = False
