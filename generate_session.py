@@ -1,106 +1,49 @@
+#!/usr/bin/env python3
 """
-generate_session.py — Telegram StringSession Generator
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Run this ONCE on any machine to generate a reusable StringSession string.
-Paste the output string into Replit Secrets as TELEGRAM_STRING_SESSION.
+generate_session.py — Generate Telegram String Session
 
-After that, the main system starts silently with no phone/SMS prompts —
-perfect for cloud deployment (Replit, Railway, Render, VPS).
-
-Usage:
-  python generate_session.py
-
-Requirements:
-  pip install telethon python-dotenv
-
-The script reads TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE
-from environment / .env file, or prompts you to enter them if missing.
+Interactively creates a Telegram session string for use in the bot.
+Run this once to generate credentials, then add to .env
 """
 
 import asyncio
 import os
-import sys
-
-try:
-    from telethon import TelegramClient
-    from telethon.sessions import StringSession
-except ImportError:
-    print("Telethon not installed. Run:  pip install telethon")
-    sys.exit(1)
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # dotenv optional
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 
-def _prompt(env_key: str, label: str, hidden: bool = False) -> str:
-    val = os.environ.get(env_key, "").strip()
-    if val:
-        print(f"  {label}: (loaded from environment)")
-        return val
-    if hidden:
-        import getpass
-        return getpass.getpass(f"  Enter {label}: ").strip()
-    return input(f"  Enter {label}: ").strip()
+async def generate_session():
+    # Get credentials from user
+    api_id = int(input("Enter your API ID (from my.telegram.org/apps): "))
+    api_hash = input("Enter your API Hash (from my.telegram.org/apps): ")
+    phone = input("Enter your phone number (with country code, e.g., +1234567890): ")
 
+    # Create client
+    client = TelegramClient(
+        StringSession(),
+        api_id,
+        api_hash,
+        device_model="FlatWavyAccounting",
+    )
 
-async def generate():
-    print()
-    print("━" * 55)
-    print("  Gold Blueprint — Telegram StringSession Generator")
-    print("━" * 55)
-    print()
-    print("Reading credentials...")
+    # Connect and authenticate
+    await client.start(phone=phone)
 
-    api_id   = int(_prompt("TELEGRAM_API_ID",   "TELEGRAM_API_ID  (integer)"))
-    api_hash = _prompt("TELEGRAM_API_HASH",      "TELEGRAM_API_HASH")
-    phone    = _prompt("TELEGRAM_PHONE",         "TELEGRAM_PHONE  (e.g. +12025551234)")
+    # Get string session
+    session_string = client.session.save()
 
-    print()
-    print("Connecting to Telegram...")
+    print("\n" + "=" * 60)
+    print("✅ Session created successfully!")
+    print("=" * 60)
+    print("\nAdd this to your .env file:")
+    print(f"\nTELEGRAM_STRING_SESSION={session_string}")
+    print(f"TELEGRAM_API_ID={api_id}")
+    print(f"TELEGRAM_API_HASH={api_hash}")
+    print("\n" + "=" * 60)
 
-    async with TelegramClient(StringSession(), api_id, api_hash) as client:
-        await client.start(phone=phone)
-
-        me = await client.get_me()
-        session_string = client.session.save()
-
-    print()
-    print("━" * 55)
-    print(f"  Authenticated as: {me.first_name} (@{getattr(me, 'username', 'N/A')})")
-    print("━" * 55)
-    print()
-    print("  YOUR STRING SESSION (copy the entire line below):")
-    print()
-    print(session_string)
-    print()
-    print("━" * 55)
-    print("  NEXT STEPS:")
-    print("  1. Copy the string above (the long line between the rules)")
-    print("  2. Go to Replit → Secrets tab → TELEGRAM_STRING_SESSION")
-    print("  3. Paste it as the value")
-    print("  4. Run: python python-brain/main.py")
-    print("  5. No more phone/SMS prompts — fully silent startup")
-    print("━" * 55)
-    print()
-
-    # Optionally write to a local file for backup
-    out_file = "session_backup.txt"
-    try:
-        with open(out_file, "w") as f:
-            f.write(session_string + "\n")
-        print(f"  Session also saved locally to: {out_file}")
-        print("  (Keep this file private — treat it like a password)")
-        print()
-    except OSError:
-        pass
+    await client.disconnect()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(generate())
-    except KeyboardInterrupt:
-        print("\nCancelled.")
-        sys.exit(0)
+    print("Telegram Session Generator\n")
+    asyncio.run(generate_session())
