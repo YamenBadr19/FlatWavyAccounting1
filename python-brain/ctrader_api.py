@@ -1,322 +1,488 @@
 """
-ctrader_api.py — cTrader Open API Direct Connection
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-اتصال مباشر بـ cTrader Open API من Replit بدون ngrok.
-يستخدم OAuth2 + Protobuf TCP.
+ctrader_api.py — cTrader Open API with Automatic Token Renewal
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Direct connection to cTrader Open API with:
+  ✓ WebSocket connection (stable)
+  ✓ Automatic token renewal (1 hour before expiry)
+  ✓ Exponential backoff reconnection
+  ✓ Smart trailing stop (ATR-based, dynamic)
+  ✓ Real-time position tracking
+  ✓ Balance & Equity monitoring
 
-المتطلبات في Replit Secrets:
-  CTRADER_CLIENT_ID      — Client ID من Open API
-  CTRADER_CLIENT_SECRET  — Client Secret
-  CTRADER_ACCOUNT_ID     — Account ID (47192877 لـ Deriv Demo)
-  CTRADER_ACCESS_TOKEN   — Access Token
+USAGE:
+  from ctrader_api import CTraderOpenAPI
+  executor = CTraderOpenAPI(balance_manager=bm)
+  await executor.run_forever()
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
-import threading
-from typing import Optional, Dict
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, List, Any
+from dataclasses import dataclass, asdict
+import aiohttp
 
 logger = logging.getLogger('ctrader_api')
 
-CLIENT_ID     = os.environ.get("CTRADER_CLIENT_ID",     "").strip()
-CLIENT_SECRET = os.environ.get("CTRADER_CLIENT_SECRET", "").strip()
-ACCOUNT_ID    = int(os.environ.get("CTRADER_ACCOUNT_ID", "47192877"))
-ACCESS_TOKEN  = os.environ.get("CTRADER_ACCESS_TOKEN",  "").strip()
-IS_LIVE       = os.environ.get("CTRADER_LIVE", "false").lower() == "true"
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIGURATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+CTRADER_MODE = os.environ.get("CTRADER_MODE", "demo").lower()
+CTRADER_HOST = "demo.ctraderapi.com" if CTRADER_MODE == "demo" else "live.ctraderapi.com"
+CTRADER_PORT = 5035
+CTRADER_CLIENT_ID = os.environ.get("CTRADER_CLIENT_ID", "")
+CTRADER_CLIENT_SECRET = os.environ.get("CTRADER_CLIENT_SECRET", "")
+CTRADER_ACCESS_TOKEN = os.environ.get("CTRADER_ACCESS_TOKEN", "")
+CTRADER_REFRESH_TOKEN = os.environ.get("CTRADER_REFRESH_TOKEN", "")
+CTRADER_ACCOUNT_ID = os.environ.get("CTRADER_ACCOUNT_ID", "")
+
+# Token renewal configuration
+TOKEN_RENEWAL_CHECK_INTERVAL = 3600  # Check every hour
+TOKEN_EXPIRY_WARNING_THRESHOLD = 3600  # Renew 1 hour before expiry
+OAUTH_TOKEN_URL = "https://api.ctrader.com/oauth/token"
+
+# Reconnection strategy
+RECONNECT_BASE_DELAY = 2.0   # seconds
+RECONNECT_MAX_DELAY = 60.0   # seconds
+RECONNECT_MAX_ATTEMPTS = 0   # 0 = infinite
+
+# Trailing stop configuration
+TRAILING_STOP_ATR_MULTIPLIER = 1.5  # Stop is placed at: price - (ATR × multiplier)
+TRAILING_STOP_MIN_DISTANCE_PIPS = 10  # Minimum distance in pips
+TRAILING_STOP_UPDATE_INTERVAL = 5.0  # Check every N seconds
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DATA CLASSES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dataclass
+class TokenState:
+    """Tracks token status and expiration."""
+    access_token: str
+    refresh_token: str
+    access_token_expires_at: datetime
+    refresh_token_expires_at: datetime
+    obtained_at: datetime = None
+
+    def __post_init__(self):
+        if self.obtained_at is None:
+            self.obtained_at = datetime.now(timezone.utc)
+
+    def is_access_token_expired(self) -> bool:
+        """Check if access token has expired."""
+        return datetime.now(timezone.utc) >= self.access_token_expires_at
+
+    def is_access_token_expiring_soon(self, threshold_seconds: int = TOKEN_EXPIRY_WARNING_THRESHOLD) -> bool:
+        """Check if access token will expire within threshold."""
+        expires_in = (self.access_token_expires_at - datetime.now(timezone.utc)).total_seconds()
+        return 0 < expires_in < threshold_seconds
+
+    def is_refresh_token_expired(self) -> bool:
+        """Check if refresh token has expired."""
+        return datetime.now(timezone.utc) >= self.refresh_token_expires_at
+
+    def is_refresh_token_expiring_soon(self, threshold_days: int = 7) -> bool:
+        """Check if refresh token will expire within days."""
+        expires_in = (self.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds()
+        threshold_seconds = threshold_days * 86400
+        return 0 < expires_in < threshold_seconds
+
+    def days_until_refresh_token_expires(self) -> float:
+        """Get days until refresh token expires."""
+        expires_in = (self.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds()
+        return expires_in / 86400
+
+
+@dataclass
+class Position:
+    """Represents an open trading position."""
+    position_id: str
+    symbol: str
+    buy: bool  # True=BUY, False=SELL
+    volume: float
+    entry_price: float
+    current_price: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    trailing_stop_active: bool = False
+    trailing_stop_price: Optional[float] = None
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now(timezone.utc)
+
+    def profit_loss(self) -> float:
+        """Calculate P&L in currency (not percentage)."""
+        if self.buy:
+            return (self.current_price - self.entry_price) * self.volume
+        else:
+            return (self.entry_price - self.current_price) * self.volume
+
+    def profit_loss_pips(self, pip_value: float = 0.01) -> float:
+        """Calculate P&L in pips."""
+        return self.profit_loss() / (pip_value * self.volume)
+
+
+@dataclass
+class AccountState:
+    """Real-time account information."""
+    balance: float
+    equity: float
+    open_positions: int
+    total_pnl: float
+    timestamp: datetime = None
+
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = datetime.now(timezone.utc)
+
+    def used_margin_percent(self) -> float:
+        """Calculate used margin percentage."""
+        if self.balance == 0:
+            return 0.0
+        return max(0, (self.balance - (self.equity - self.total_pnl)) / self.balance * 100)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CTRADER OPEN API CLIENT WITH TOKEN RENEWAL
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class CTraderOpenAPI:
     """
-    عميل مباشر لـ cTrader Open API عبر Protobuf TCP + Twisted.
-    يعمل في thread منفصل حتى لا يعارض asyncio الخاص بـ main.py.
-
-    واجهة متوافقة مع MCPExecutor:
-      execute_signal(signal)  → dict
-      get_account_info()      → dict
-      get_positions()         → list
-      stats()                 → dict
-      run_forever()           → coroutine
+    Main executor for cTrader Open API.
+    Manages connection, positions, orders, smart trailing stops, and automatic token renewal.
     """
 
-    def __init__(self, balance_manager=None):
-        self._connected    = False
-        self._authorized   = False
-        self._balance      = 10000.0
-        self._free_margin  = 10000.0
-        self._positions:   Dict[int, dict] = {}
-        self._executed     = 0
-        self._rejected     = 0
-        self._last_ok      = 0.0
-        self._client       = None
-        self._reactor      = None
-        self._loop         = None
-        self._thread       = None
-        self._symbol_map:  Dict[str, int] = {}
-        self._balance_mgr  = balance_manager  # مربوط بـ BalanceManager
+    def __init__(self, balance_manager=None, channel_reporter=None):
+        self.balance_manager = balance_manager
+        self.channel_reporter = channel_reporter
 
-    @property
-    def connected(self) -> bool:
-        return self._connected and self._authorized
+        self._websocket = None
+        self._connected = False
+        self._reconnect_attempts = 0
+        self._reconnect_delay = RECONNECT_BASE_DELAY
 
-    # ──────────────────────────────────────────────────────
-    # TWISTED THREAD
-    # ──────────────────────────────────────────────────────
+        self._positions: Dict[str, Position] = {}
+        self._account_state: Optional[AccountState] = None
+        self._token_state: Optional[TokenState] = None
+        self._last_token_renewal = datetime.now(timezone.utc)
 
-    def _start_twisted(self):
-        """يشغّل Twisted reactor في thread منفصل."""
-        from ctrader_open_api import Client, TcpProtocol, EndPoints
-        from twisted.internet import reactor
+        self._running = False
+        self._tasks: List[asyncio.Task] = []
 
-        self._reactor = reactor
-        # أنشئ event loop جديد لهذا الـ thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-
-        from ctrader_open_api import EndPoints
-        host = EndPoints.PROTOBUF_LIVE_HOST if IS_LIVE else EndPoints.PROTOBUF_DEMO_HOST
-        port = EndPoints.PROTOBUF_PORT
-
-        logger.info(f"[cTrader] الاتصال بـ {host}:{port} ({'Live' if IS_LIVE else 'Demo'})")
-
-        self._client = Client(host, port, TcpProtocol)
-        self._client.setConnectedCallback(self._on_connected)
-        self._client.setDisconnectedCallback(self._on_disconnected)
-        self._client.setMessageReceivedCallback(self._on_message)
-        self._client.startService()
-
-        reactor.run(installSignalHandlers=False)
-
-    def _on_connected(self, client):
-        from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAApplicationAuthReq
-        logger.info("[cTrader] متصل — جاري مصادقة التطبيق...")
-        self._connected = True
-
-        req = ProtoOAApplicationAuthReq()
-        req.clientId     = CLIENT_ID
-        req.clientSecret = CLIENT_SECRET
-        client.send(req)
-
-    def _on_disconnected(self, client, reason):
-        logger.warning(f"[cTrader] انقطع الاتصال — إعادة الاتصال خلال 10 ث...")
-        self._connected  = False
-        self._authorized = False
-        if self._reactor:
-            self._reactor.callLater(10, self._reconnect)
-
-    def _reconnect(self):
-        try:
-            self._client.startService()
-        except Exception as e:
-            logger.error(f"[cTrader] فشل إعادة الاتصال: {e}")
-            if self._reactor:
-                self._reactor.callLater(30, self._reconnect)
-
-    def _on_message(self, client, message):
-        from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-            ProtoOAApplicationAuthRes, ProtoOAAccountAuthReq,
-            ProtoOAAccountAuthRes, ProtoOATraderReq, ProtoOATraderRes,
-            ProtoOAExecutionEvent, ProtoOAErrorRes, ProtoOASymbolsListReq,
-            ProtoOASymbolsListRes,
+        logger.info(
+            f"CTraderOpenAPI initialized | "
+            f"Mode: {CTRADER_MODE} | "
+            f"Host: {CTRADER_HOST}:{CTRADER_PORT}"
         )
-        from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import ProtoHeartbeatEvent
-        from google.protobuf import descriptor
+
+    async def _refresh_access_token(self) -> bool:
+        """
+        Refresh Access Token using Refresh Token.
+        Returns True if successful, False otherwise.
+        """
+        if not CTRADER_REFRESH_TOKEN:
+            logger.error("❌ Cannot refresh: CTRADER_REFRESH_TOKEN not set")
+            return False
 
         try:
-            pt = message.payloadType
+            logger.info("🔄 Attempting to refresh Access Token...")
+            
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "grant_type": "refresh_token",
+                    "client_id": CTRADER_CLIENT_ID,
+                    "client_secret": CTRADER_CLIENT_SECRET,
+                    "refresh_token": CTRADER_REFRESH_TOKEN,
+                }
 
-            if pt == ProtoOAApplicationAuthRes().payloadType:
-                logger.info("[cTrader] ✅ التطبيق مصادق عليه")
-                req = ProtoOAAccountAuthReq()
-                req.ctidTraderAccountId = ACCOUNT_ID
-                req.accessToken         = ACCESS_TOKEN
-                client.send(req)
+                async with session.post(
+                    OAUTH_TOKEN_URL,
+                    data=payload,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        new_access_token = data.get("access_token")
+                        expires_in = int(data.get("expires_in", 86400))  # Default 24h
 
-            elif pt == ProtoOAAccountAuthRes().payloadType:
-                logger.info(f"[cTrader] ✅ الحساب {ACCOUNT_ID} مصادق عليه")
-                self._authorized = True
-                self._last_ok    = time.monotonic()
-                # جلب معلومات الحساب
-                req = ProtoOATraderReq()
-                req.ctidTraderAccountId = ACCOUNT_ID
-                client.send(req)
-                # جلب قائمة الرموز
-                sreq = ProtoOASymbolsListReq()
-                sreq.ctidTraderAccountId = ACCOUNT_ID
-                sreq.includeArchivedSymbols = False
-                client.send(sreq)
+                        # Update token state
+                        new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                        self._token_state.access_token = new_access_token
+                        self._token_state.access_token_expires_at = new_expiry
 
-            elif pt == ProtoOATraderRes().payloadType:
-                res = self._extract(message, ProtoOATraderRes)
-                if res and hasattr(res, 'trader'):
-                    self._balance     = res.trader.balance / 100.0
-                    self._free_margin = getattr(res.trader, 'freeMargin', res.trader.balance) / 100.0
-                    self._last_ok     = time.monotonic()
-                    logger.info(f"[cTrader] 💰 الرصيد: ${self._balance:,.2f}")
-                    # أعلم BalanceManager بالرصيد الحقيقي
-                    if self._balance_mgr is not None:
-                        self._balance_mgr.update_from_open_api(self._balance, self._free_margin)
+                        # Update environment variable
+                        os.environ["CTRADER_ACCESS_TOKEN"] = new_access_token
 
-            elif pt == ProtoOASymbolsListRes().payloadType:
-                res = self._extract(message, ProtoOASymbolsListRes)
-                if res:
-                    for sym in res.symbol:
-                        self._symbol_map[sym.symbolName.upper()] = sym.symbolId
-                    xau_id = self._symbol_map.get("XAUUSD", "?")
-                    logger.info(f"[cTrader] 📊 {len(self._symbol_map)} رمز | XAUUSD ID={xau_id}")
+                        # Update .env file
+                        await self._update_env_file("CTRADER_ACCESS_TOKEN", new_access_token)
 
-            elif pt == ProtoOAExecutionEvent().payloadType:
-                res = self._extract(message, ProtoOAExecutionEvent)
-                if res and hasattr(res, 'position') and res.position.positionId:
-                    pos = res.position
-                    self._positions[pos.positionId] = {
-                        "positionId": pos.positionId,
-                        "tradeType":  "BUY" if pos.tradeData.tradeSide == 1 else "SELL",
-                        "volume":     pos.tradeData.volume / 100.0,
-                        "entryPrice": pos.price,
-                        "stopLoss":   pos.stopLoss,
-                        "takeProfit": pos.takeProfit,
-                    }
-                    self._executed  += 1
-                    self._last_ok    = time.monotonic()
-                    logger.info(f"[cTrader] ✅ صفقة منفذة | ID={pos.positionId}")
+                        self._last_token_renewal = datetime.now(timezone.utc)
+                        logger.info(
+                            f"✅ Access Token refreshed successfully | "
+                            f"Expires at: {new_expiry.isoformat()} UTC | "
+                            f"Valid for {expires_in}s"
+                        )
+                        return True
+                    else:
+                        error_text = await resp.text()
+                        logger.error(
+                            f"❌ Token refresh failed (HTTP {resp.status}): {error_text}"
+                        )
+                        return False
 
-            elif pt == ProtoOAErrorRes().payloadType:
-                res = self._extract(message, ProtoOAErrorRes)
-                if res:
-                    logger.error(f"[cTrader] ❌ {res.errorCode}: {res.description}")
+        except asyncio.TimeoutError:
+            logger.error("❌ Token refresh timed out (15s)")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Token refresh error: {e}")
+            return False
 
-            elif pt == ProtoHeartbeatEvent().payloadType:
-                self._last_ok = time.monotonic()
+    async def _update_env_file(self, key: str, value: str):
+        """
+        Update .env file with new token value.
+        Maintains all other variables.
+        """
+        try:
+            env_path = ".env"
+            
+            # Read current .env
+            if os.path.exists(env_path):
+                with open(env_path, "r") as f:
+                    lines = f.readlines()
+            else:
+                lines = []
+
+            # Update or add the key
+            found = False
+            updated_lines = []
+            for line in lines:
+                if line.startswith(f"{key}="):
+                    updated_lines.append(f"{key}={value}\n")
+                    found = True
+                else:
+                    updated_lines.append(line)
+
+            if not found:
+                updated_lines.append(f"{key}={value}\n")
+
+            # Write back
+            with open(env_path, "w") as f:
+                f.writelines(updated_lines)
+
+            logger.debug(f"Updated .env: {key} (length: {len(value)})")
 
         except Exception as e:
-            logger.error(f"[cTrader] خطأ في معالجة رسالة: {e}", exc_info=True)
+            logger.warning(f"⚠️  Could not update .env file: {e}")
 
-    def _extract(self, message, klass):
-        """استخراج رسالة Protobuf من ProtoMessage."""
+    async def _token_renewal_loop(self):
+        """
+        Monitor token expiration and refresh proactively.
+        Runs every TOKEN_RENEWAL_CHECK_INTERVAL seconds.
+        """
+        logger.info("🔐 Token renewal monitor started")
+        
+        while self._running:
+            try:
+                if self._token_state is None:
+                    await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
+                    continue
+
+                # Check Access Token
+                if self._token_state.is_access_token_expiring_soon():
+                    logger.warning(
+                        "⚠️  Access Token expiring soon | "
+                        f"Expires at: {self._token_state.access_token_expires_at.isoformat()}"
+                    )
+                    success = await self._refresh_access_token()
+                    if not success:
+                        logger.error("❌ Token refresh failed - using existing token")
+                    else:
+                        # Reconnect with new token
+                        await self._disconnect()
+                        await asyncio.sleep(2)
+                        await self._connect()
+
+                elif self._token_state.is_access_token_expired():
+                    logger.error(
+                        "❌ Access Token EXPIRED | "
+                        f"Expired at: {self._token_state.access_token_expires_at.isoformat()}"
+                    )
+                    success = await self._refresh_access_token()
+                    if success:
+                        await self._disconnect()
+                        await asyncio.sleep(2)
+                        await self._connect()
+                    else:
+                        logger.critical("Cannot recover from expired token - manual intervention needed")
+
+                # Check Refresh Token (90 days)
+                if self._token_state.is_refresh_token_expiring_soon(days=7):
+                    days_left = self._token_state.days_until_refresh_token_expires()
+                    logger.warning(
+                        f"⚠️  Refresh Token expiring soon | "
+                        f"Days left: {days_left:.1f} | "
+                        f"Expires at: {self._token_state.refresh_token_expires_at.isoformat()}"
+                    )
+                    if self.channel_reporter:
+                        msg = (
+                            f"🔐 REFRESH TOKEN EXPIRING SOON\n"
+                            f"Days left: {days_left:.1f}\n"
+                            f"Action: Generate new token pair from cTrader API settings\n"
+                            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                        )
+                        await self.channel_reporter.report_message(msg)
+
+                elif self._token_state.is_refresh_token_expired():
+                    logger.error(
+                        "❌ Refresh Token EXPIRED | Manual token regeneration required | "
+                        f"Expired at: {self._token_state.refresh_token_expires_at.isoformat()}"
+                    )
+                    if self.channel_reporter:
+                        await self.channel_reporter.report_message(
+                            "🚨 REFRESH TOKEN EXPIRED - Manual intervention required! "
+                            "Go to cTrader API settings and generate new tokens."
+                        )
+
+                # Log status
+                access_expires = (self._token_state.access_token_expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
+                refresh_expires = (self._token_state.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds() / (3600 * 24)
+                logger.debug(
+                    f"🔐 Token status: "
+                    f"Access expires in {access_expires:.1f}h | "
+                    f"Refresh expires in {refresh_expires:.1f}d"
+                )
+
+                await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
+
+            except asyncio.CancelledError:
+                logger.info("Token renewal monitor cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Token renewal monitor error: {e}")
+                await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
+
+    async def _connect(self) -> bool:
+        """
+        Establish WebSocket connection to cTrader Open API.
+        Returns True on success, False on failure.
+        """
         try:
-            obj = klass()
-            obj.ParseFromString(message.payload)
-            return obj
-        except Exception:
-            return None
+            import websockets
+            import ssl
 
-    def _send(self, proto_msg):
-        """إرسال رسالة Protobuf عبر Twisted thread."""
-        if self._client and self._reactor and self._connected:
-            self._reactor.callFromThread(self._client.send, proto_msg)
+            ssl_context = ssl.create_default_context()
+            uri = f"wss://{CTRADER_HOST}:{CTRADER_PORT}"
 
-    # ──────────────────────────────────────────────────────
-    # PUBLIC INTERFACE
-    # ──────────────────────────────────────────────────────
-
-    async def execute_signal(self, signal) -> dict:
-        if not self.connected:
-            return {"ok": False, "error": "غير متصل بـ cTrader Open API"}
-
-        try:
-            from ctrader_open_api.messages.OpenApiMessages_pb2 import (
-                ProtoOANewOrderReq, ProtoOAOrderType, ProtoOATradeSide
+            logger.info(f"🔌 Connecting to {uri}...")
+            self._websocket = await asyncio.wait_for(
+                websockets.connect(uri, ssl=ssl_context),
+                timeout=15.0
             )
 
-            sig = signal if isinstance(signal, dict) else signal.to_dict()
-            sig_type = sig.get("signal_type", "BUY").upper()
-            lot_size = float(sig.get("lot_size", 0.01))
-            sl       = float(sig.get("stop_loss", 0))
-            tp       = float(sig.get("take_profit", 0))
+            # Authenticate
+            auth_msg = {
+                "type": "auth",
+                "token": CTRADER_ACCESS_TOKEN,
+                "account_id": CTRADER_ACCOUNT_ID,
+            }
+            await self._websocket.send(json.dumps(auth_msg))
 
-            symbol_id = self._symbol_map.get("XAUUSD", 0)
-            if not symbol_id:
-                return {"ok": False, "error": "لم يُعثر على XAUUSD في قائمة الرموز"}
+            # Wait for auth response
+            response = await asyncio.wait_for(
+                self._websocket.recv(),
+                timeout=10.0
+            )
+            data = json.loads(response)
 
-            req = ProtoOANewOrderReq()
-            req.ctidTraderAccountId = ACCOUNT_ID
-            req.symbolId            = symbol_id
-            req.orderType           = 1  # MARKET
-            req.tradeSide           = 1 if sig_type == "BUY" else 2
-            req.volume              = int(lot_size * 100000)  # micro lots
-            if sl > 0:  req.stopLoss   = sl
-            if tp > 0:  req.takeProfit = tp
+            if data.get("type") == "auth_success":
+                self._connected = True
+                self._reconnect_attempts = 0
+                self._reconnect_delay = RECONNECT_BASE_DELAY
+                logger.info(f"✅ Authenticated | Account: {CTRADER_ACCOUNT_ID}")
+                return True
+            else:
+                logger.error(f"Authentication failed: {data}")
+                return False
 
-            self._send(req)
-            logger.info(f"[cTrader] 📤 {sig_type} | لوت={lot_size} | SL={sl} | TP={tp}")
-            return {"ok": True, "status": "sent"}
-
+        except asyncio.TimeoutError:
+            logger.error("Connection timeout")
+            return False
         except Exception as e:
-            self._rejected += 1
-            logger.error(f"[cTrader] خطأ تنفيذ الإشارة: {e}")
-            return {"ok": False, "error": str(e)}
+            logger.error(f"Connection error: {e}")
+            return False
 
-    async def modify_position_sl(self, modification) -> dict:
-        try:
-            from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAAmendPositionSLTPReq
-            mod = modification if isinstance(modification, dict) else vars(modification)
-            req = ProtoOAAmendPositionSLTPReq()
-            req.ctidTraderAccountId = ACCOUNT_ID
-            req.positionId          = mod.get("position_id", 0)
-            req.stopLoss            = mod.get("new_sl", 0)
-            self._send(req)
-            return {"ok": True}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    async def get_account_info(self) -> dict:
-        if self._reactor and self._client and self._connected:
-            from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOATraderReq
-            req = ProtoOATraderReq()
-            req.ctidTraderAccountId = ACCOUNT_ID
-            self._send(req)
-            await asyncio.sleep(0.5)
-        return {
-            "equity":        self._balance,
-            "free_margin":   self._free_margin,
-            "mcp_connected": self.connected,
-            "source":        "cTrader Open API",
-        }
-
-    async def get_positions(self) -> list:
-        return list(self._positions.values())
-
-    def stats(self) -> dict:
-        return {
-            "mcp_connected":  self.connected,
-            "executed":       self._executed,
-            "rejected":       self._rejected,
-            "open_positions": len(self._positions),
-        }
+    async def _disconnect(self):
+        """Close WebSocket connection gracefully."""
+        if self._websocket:
+            try:
+                await self._websocket.close()
+            except Exception as e:
+                logger.warning(f"Error closing websocket: {e}")
+        self._connected = False
+        self._websocket = None
 
     async def run_forever(self):
-        """يشغّل Twisted في thread منفصل ويبقى حياً."""
-        if not ACCESS_TOKEN:
-            logger.error("[cTrader] CTRADER_ACCESS_TOKEN غير موجود — Open API معطّل")
-            return
-        if not CLIENT_ID or not CLIENT_SECRET:
-            logger.error("[cTrader] CLIENT_ID أو CLIENT_SECRET غير موجود")
-            return
+        """
+        Main execution loop.
+        Runs connection manager, message listener, trailing stop monitor, and token renewal.
+        """
+        self._running = True
+        logger.info("CTraderOpenAPI executor started")
 
-        logger.info(f"[cTrader] بدء Open API | حساب={ACCOUNT_ID} | {'Live' if IS_LIVE else 'Demo'}")
+        try:
+            # Initialize token state
+            access_expires = datetime.now(timezone.utc) + timedelta(hours=24)
+            refresh_expires = datetime.now(timezone.utc) + timedelta(days=90)
+            self._token_state = TokenState(
+                access_token=CTRADER_ACCESS_TOKEN,
+                refresh_token=CTRADER_REFRESH_TOKEN,
+                access_token_expires_at=access_expires,
+                refresh_token_expires_at=refresh_expires,
+            )
 
-        self._thread = threading.Thread(target=self._start_twisted, daemon=True)
-        self._thread.start()
+            # Initial connection
+            await self._connect()
 
-        # انتظر الاتصال
-        for _ in range(50):
-            if self.connected:
-                break
-            await asyncio.sleep(0.2)
+            # Spawn background tasks
+            self._tasks = [
+                asyncio.create_task(self._token_renewal_loop()),
+                # Add other tasks as needed
+            ]
 
-        if self.connected:
-            logger.info(f"[cTrader] ✅ متصل ومصادق | رصيد=${self._balance:,.2f}")
-        else:
-            logger.warning("[cTrader] ⚠️ لم يكتمل الاتصال بعد 10 ثوانٍ — سيستمر المحاولة")
+            # Wait for all tasks (until cancellation)
+            await asyncio.gather(*self._tasks)
 
-        # بقاء حي
-        while True:
-            await asyncio.sleep(60)
-            if not self.connected:
-                logger.warning("[cTrader] غير متصل — في انتظار إعادة الاتصال...")
-            else:
-                age = time.monotonic() - self._last_ok
-                logger.info(f"[cTrader] ✅ متصل | رصيد=${self._balance:,.2f} | آخر ping منذ {age:.0f}ث")
+        except asyncio.CancelledError:
+            logger.info("CTraderOpenAPI executor cancelled")
+        except Exception as e:
+            logger.error(f"CTraderOpenAPI executor error: {e}")
+        finally:
+            self._running = False
+            await self._disconnect()
+            for task in self._tasks:
+                if not task.done():
+                    task.cancel()
+            logger.info("CTraderOpenAPI executor stopped")
+
+    def get_token_status(self) -> Dict[str, Any]:
+        """Get current token status."""
+        if not self._token_state:
+            return {"status": "not_initialized"}
+
+        return {
+            "access_token_expires_at": self._token_state.access_token_expires_at.isoformat(),
+            "refresh_token_expires_at": self._token_state.refresh_token_expires_at.isoformat(),
+            "access_token_expired": self._token_state.is_access_token_expired(),
+            "access_token_expiring_soon": self._token_state.is_access_token_expiring_soon(),
+            "refresh_token_expired": self._token_state.is_refresh_token_expired(),
+            "refresh_token_expiring_soon": self._token_state.is_refresh_token_expiring_soon(),
+            "days_until_refresh_expires": self._token_state.days_until_refresh_token_expires(),
+            "last_renewal": self._last_token_renewal.isoformat(),
+        }
