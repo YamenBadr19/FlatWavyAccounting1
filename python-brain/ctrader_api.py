@@ -1,18 +1,16 @@
 """
-ctrader_api.py — cTrader Open API with Automatic Token Renewal
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Direct connection to cTrader Open API with:
-  ✓ WebSocket connection (stable)
-  ✓ Automatic token renewal (1 hour before expiry)
-  ✓ Exponential backoff reconnection
-  ✓ Smart trailing stop (ATR-based, dynamic)
-  ✓ Real-time position tracking
-  ✓ Balance & Equity monitoring
+ctrader_api.py — cTrader Open API v2 (REST + OAuth)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Uses the cTrader Open API REST endpoints for:
+  ✓ Account info & balance
+  ✓ Place market / limit orders
+  ✓ Manage positions (close, modify SL/TP)
+  ✓ Automatic Access Token renewal via Refresh Token
+  ✓ Exponential backoff on HTTP errors
+  ✓ Compatible interface with MCPExecutor (stats, get_positions, execute_signal)
 
-USAGE:
-  from ctrader_api import CTraderOpenAPI
-  executor = CTraderOpenAPI(balance_manager=bm)
-  await executor.run_forever()
+REST base:  https://api.ctrader.com/
+OAuth:      https://api.ctrader.com/oauth/token
 """
 
 import asyncio
@@ -22,38 +20,32 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import aiohttp
 
 logger = logging.getLogger('ctrader_api')
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURATION
+# CONFIGURATION  (read lazily so env updates are picked up)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CTRADER_MODE = os.environ.get("CTRADER_MODE", "demo").lower()
-CTRADER_HOST = "demo.ctraderapi.com" if CTRADER_MODE == "demo" else "live.ctraderapi.com"
-CTRADER_PORT = 5035
-CTRADER_CLIENT_ID = os.environ.get("CTRADER_CLIENT_ID", "")
-CTRADER_CLIENT_SECRET = os.environ.get("CTRADER_CLIENT_SECRET", "")
-CTRADER_ACCESS_TOKEN = os.environ.get("CTRADER_ACCESS_TOKEN", "")
-CTRADER_REFRESH_TOKEN = os.environ.get("CTRADER_REFRESH_TOKEN", "")
-CTRADER_ACCOUNT_ID = os.environ.get("CTRADER_ACCOUNT_ID", "")
+def _cfg(key: str, default: str = "") -> str:
+    return os.environ.get(key, default).strip()
 
-# Token renewal configuration
-TOKEN_RENEWAL_CHECK_INTERVAL = 3600  # Check every hour
-TOKEN_EXPIRY_WARNING_THRESHOLD = 3600  # Renew 1 hour before expiry
-OAUTH_TOKEN_URL = "https://api.ctrader.com/oauth/token"
+CTRADER_MODE         = _cfg("CTRADER_MODE", "demo").lower()
+CTRADER_ACCOUNT_ID   = _cfg("CTRADER_ACCOUNT_ID")
+OAUTH_TOKEN_URL      = "https://api.ctrader.com/oauth/token"
+REST_BASE            = "https://api.ctrader.com"
 
-# Reconnection strategy
-RECONNECT_BASE_DELAY = 2.0   # seconds
-RECONNECT_MAX_DELAY = 60.0   # seconds
-RECONNECT_MAX_ATTEMPTS = 0   # 0 = infinite
+# Token renewal
+TOKEN_RENEWAL_CHECK_INTERVAL    = 3600   # seconds between checks
+TOKEN_EXPIRY_WARNING_THRESHOLD  = 3600   # renew 1 h before expiry
+REFRESH_TOKEN_WARNING_DAYS      = 7      # warn when < 7 days left
 
-# Trailing stop configuration
-TRAILING_STOP_ATR_MULTIPLIER = 1.5  # Stop is placed at: price - (ATR × multiplier)
-TRAILING_STOP_MIN_DISTANCE_PIPS = 10  # Minimum distance in pips
-TRAILING_STOP_UPDATE_INTERVAL = 5.0  # Check every N seconds
+# HTTP retry
+HTTP_TIMEOUT   = 15.0   # seconds
+MAX_RETRIES    = 3
+RETRY_BACKOFF  = 2.0    # seconds (doubles each attempt)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -62,7 +54,6 @@ TRAILING_STOP_UPDATE_INTERVAL = 5.0  # Check every N seconds
 
 @dataclass
 class TokenState:
-    """Tracks token status and expiration."""
     access_token: str
     refresh_token: str
     access_token_expires_at: datetime
@@ -74,64 +65,26 @@ class TokenState:
             self.obtained_at = datetime.now(timezone.utc)
 
     def is_access_token_expired(self) -> bool:
-        """Check if access token has expired."""
         return datetime.now(timezone.utc) >= self.access_token_expires_at
 
     def is_access_token_expiring_soon(self, threshold_seconds: int = TOKEN_EXPIRY_WARNING_THRESHOLD) -> bool:
-        """Check if access token will expire within threshold."""
-        expires_in = (self.access_token_expires_at - datetime.now(timezone.utc)).total_seconds()
-        return 0 < expires_in < threshold_seconds
+        secs = (self.access_token_expires_at - datetime.now(timezone.utc)).total_seconds()
+        return 0 < secs < threshold_seconds
 
     def is_refresh_token_expired(self) -> bool:
-        """Check if refresh token has expired."""
         return datetime.now(timezone.utc) >= self.refresh_token_expires_at
 
-    def is_refresh_token_expiring_soon(self, threshold_days: int = 7) -> bool:
-        """Check if refresh token will expire within days."""
-        expires_in = (self.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds()
-        threshold_seconds = threshold_days * 86400
-        return 0 < expires_in < threshold_seconds
+    def is_refresh_token_expiring_soon(self, threshold_days: int = REFRESH_TOKEN_WARNING_DAYS) -> bool:
+        secs = (self.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds()
+        return 0 < secs < threshold_days * 86400
 
-    def days_until_refresh_token_expires(self) -> float:
-        """Get days until refresh token expires."""
-        expires_in = (self.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds()
-        return expires_in / 86400
-
-
-@dataclass
-class Position:
-    """Represents an open trading position."""
-    position_id: str
-    symbol: str
-    buy: bool  # True=BUY, False=SELL
-    volume: float
-    entry_price: float
-    current_price: float
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    trailing_stop_active: bool = False
-    trailing_stop_price: Optional[float] = None
-    timestamp: datetime = None
-
-    def __post_init__(self):
-        if self.timestamp is None:
-            self.timestamp = datetime.now(timezone.utc)
-
-    def profit_loss(self) -> float:
-        """Calculate P&L in currency (not percentage)."""
-        if self.buy:
-            return (self.current_price - self.entry_price) * self.volume
-        else:
-            return (self.entry_price - self.current_price) * self.volume
-
-    def profit_loss_pips(self, pip_value: float = 0.01) -> float:
-        """Calculate P&L in pips."""
-        return self.profit_loss() / (pip_value * self.volume)
+    def days_until_refresh_expires(self) -> float:
+        secs = (self.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds()
+        return secs / 86400
 
 
 @dataclass
 class AccountState:
-    """Real-time account information."""
     balance: float
     equity: float
     open_positions: int
@@ -142,347 +95,351 @@ class AccountState:
         if self.timestamp is None:
             self.timestamp = datetime.now(timezone.utc)
 
-    def used_margin_percent(self) -> float:
-        """Calculate used margin percentage."""
-        if self.balance == 0:
-            return 0.0
-        return max(0, (self.balance - (self.equity - self.total_pnl)) / self.balance * 100)
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CTRADER OPEN API CLIENT WITH TOKEN RENEWAL
+# MAIN CLIENT
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class CTraderOpenAPI:
     """
-    Main executor for cTrader Open API.
-    Manages connection, positions, orders, smart trailing stops, and automatic token renewal.
+    cTrader Open API client using REST endpoints.
+    Provides the same interface as MCPExecutor so main.py needs no changes.
     """
 
     def __init__(self, balance_manager=None, channel_reporter=None):
-        self.balance_manager = balance_manager
+        self.balance_manager  = balance_manager
         self.channel_reporter = channel_reporter
 
-        self._websocket = None
-        self._connected = False
-        self._reconnect_attempts = 0
-        self._reconnect_delay = RECONNECT_BASE_DELAY
-
-        self._positions: Dict[str, Position] = {}
+        self._token_state:   Optional[TokenState]   = None
         self._account_state: Optional[AccountState] = None
-        self._token_state: Optional[TokenState] = None
-        self._last_token_renewal = datetime.now(timezone.utc)
+        self._connected      = False
+        self._running        = False
+        self._tasks:         List[asyncio.Task]     = []
+        self._last_renewal   = datetime.now(timezone.utc)
 
-        self._running = False
-        self._tasks: List[asyncio.Task] = []
+        # Stats (mirrors MCPExecutor interface)
+        self._executed   = 0
+        self._rejected   = 0
+        self._positions: Dict[str, dict] = {}
 
         logger.info(
-            f"CTraderOpenAPI initialized | "
-            f"Mode: {CTRADER_MODE} | "
-            f"Host: {CTRADER_HOST}:{CTRADER_PORT}"
+            f"CTraderOpenAPI initialized | Mode: {CTRADER_MODE} | "
+            f"Account: {CTRADER_ACCOUNT_ID or '(not set)'}"
         )
 
-    async def _refresh_access_token(self) -> bool:
-        """
-        Refresh Access Token using Refresh Token.
-        Returns True if successful, False otherwise.
-        """
-        if not CTRADER_REFRESH_TOKEN:
-            logger.error("❌ Cannot refresh: CTRADER_REFRESH_TOKEN not set")
-            return False
+    # ── Helpers ─────────────────────────────────────────────────
 
-        try:
-            logger.info("🔄 Attempting to refresh Access Token...")
-            
-            async with aiohttp.ClientSession() as session:
-                payload = {
-                    "grant_type": "refresh_token",
-                    "client_id": CTRADER_CLIENT_ID,
-                    "client_secret": CTRADER_CLIENT_SECRET,
-                    "refresh_token": CTRADER_REFRESH_TOKEN,
-                }
+    def _headers(self) -> dict:
+        token = self._token_state.access_token if self._token_state else _cfg("CTRADER_ACCESS_TOKEN")
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type":  "application/json",
+        }
 
-                async with session.post(
-                    OAUTH_TOKEN_URL,
-                    data=payload,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        new_access_token = data.get("access_token")
-                        expires_in = int(data.get("expires_in", 86400))  # Default 24h
-
-                        # Update token state
-                        new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                        self._token_state.access_token = new_access_token
-                        self._token_state.access_token_expires_at = new_expiry
-
-                        # Update environment variable
-                        os.environ["CTRADER_ACCESS_TOKEN"] = new_access_token
-
-                        # Update .env file
-                        await self._update_env_file("CTRADER_ACCESS_TOKEN", new_access_token)
-
-                        self._last_token_renewal = datetime.now(timezone.utc)
-                        logger.info(
-                            f"✅ Access Token refreshed successfully | "
-                            f"Expires at: {new_expiry.isoformat()} UTC | "
-                            f"Valid for {expires_in}s"
-                        )
-                        return True
-                    else:
-                        error_text = await resp.text()
-                        logger.error(
-                            f"❌ Token refresh failed (HTTP {resp.status}): {error_text}"
-                        )
-                        return False
-
-        except asyncio.TimeoutError:
-            logger.error("❌ Token refresh timed out (15s)")
-            return False
-        except Exception as e:
-            logger.error(f"❌ Token refresh error: {e}")
-            return False
-
-    async def _update_env_file(self, key: str, value: str):
-        """
-        Update .env file with new token value.
-        Maintains all other variables.
-        """
-        try:
-            env_path = ".env"
-            
-            # Read current .env
-            if os.path.exists(env_path):
-                with open(env_path, "r") as f:
-                    lines = f.readlines()
-            else:
-                lines = []
-
-            # Update or add the key
-            found = False
-            updated_lines = []
-            for line in lines:
-                if line.startswith(f"{key}="):
-                    updated_lines.append(f"{key}={value}\n")
-                    found = True
-                else:
-                    updated_lines.append(line)
-
-            if not found:
-                updated_lines.append(f"{key}={value}\n")
-
-            # Write back
-            with open(env_path, "w") as f:
-                f.writelines(updated_lines)
-
-            logger.debug(f"Updated .env: {key} (length: {len(value)})")
-
-        except Exception as e:
-            logger.warning(f"⚠️  Could not update .env file: {e}")
-
-    async def _token_renewal_loop(self):
-        """
-        Monitor token expiration and refresh proactively.
-        Runs every TOKEN_RENEWAL_CHECK_INTERVAL seconds.
-        """
-        logger.info("🔐 Token renewal monitor started")
-        
-        while self._running:
+    async def _get(self, path: str) -> Optional[dict]:
+        url = f"{REST_BASE}{path}"
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                if self._token_state is None:
-                    await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
-                    continue
-
-                # Check Access Token
-                if self._token_state.is_access_token_expiring_soon():
-                    logger.warning(
-                        "⚠️  Access Token expiring soon | "
-                        f"Expires at: {self._token_state.access_token_expires_at.isoformat()}"
-                    )
-                    success = await self._refresh_access_token()
-                    if not success:
-                        logger.error("❌ Token refresh failed - using existing token")
-                    else:
-                        # Reconnect with new token
-                        await self._disconnect()
-                        await asyncio.sleep(2)
-                        await self._connect()
-
-                elif self._token_state.is_access_token_expired():
-                    logger.error(
-                        "❌ Access Token EXPIRED | "
-                        f"Expired at: {self._token_state.access_token_expires_at.isoformat()}"
-                    )
-                    success = await self._refresh_access_token()
-                    if success:
-                        await self._disconnect()
-                        await asyncio.sleep(2)
-                        await self._connect()
-                    else:
-                        logger.critical("Cannot recover from expired token - manual intervention needed")
-
-                # Check Refresh Token (90 days)
-                if self._token_state.is_refresh_token_expiring_soon(days=7):
-                    days_left = self._token_state.days_until_refresh_token_expires()
-                    logger.warning(
-                        f"⚠️  Refresh Token expiring soon | "
-                        f"Days left: {days_left:.1f} | "
-                        f"Expires at: {self._token_state.refresh_token_expires_at.isoformat()}"
-                    )
-                    if self.channel_reporter:
-                        msg = (
-                            f"🔐 REFRESH TOKEN EXPIRING SOON\n"
-                            f"Days left: {days_left:.1f}\n"
-                            f"Action: Generate new token pair from cTrader API settings\n"
-                            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                        )
-                        await self.channel_reporter.report_message(msg)
-
-                elif self._token_state.is_refresh_token_expired():
-                    logger.error(
-                        "❌ Refresh Token EXPIRED | Manual token regeneration required | "
-                        f"Expired at: {self._token_state.refresh_token_expires_at.isoformat()}"
-                    )
-                    if self.channel_reporter:
-                        await self.channel_reporter.report_message(
-                            "🚨 REFRESH TOKEN EXPIRED - Manual intervention required! "
-                            "Go to cTrader API settings and generate new tokens."
-                        )
-
-                # Log status
-                access_expires = (self._token_state.access_token_expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
-                refresh_expires = (self._token_state.refresh_token_expires_at - datetime.now(timezone.utc)).total_seconds() / (3600 * 24)
-                logger.debug(
-                    f"🔐 Token status: "
-                    f"Access expires in {access_expires:.1f}h | "
-                    f"Refresh expires in {refresh_expires:.1f}d"
-                )
-
-                await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
-
-            except asyncio.CancelledError:
-                logger.info("Token renewal monitor cancelled")
-                break
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(url, headers=self._headers(),
+                                     timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as r:
+                        if r.status == 401:
+                            logger.warning("GET 401 — attempting token refresh")
+                            await self._refresh_token()
+                            continue
+                        if r.status == 200:
+                            return await r.json()
+                        logger.warning(f"GET {path} → HTTP {r.status}: {await r.text()}")
             except Exception as e:
-                logger.error(f"Token renewal monitor error: {e}")
-                await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
+                logger.warning(f"GET {path} attempt {attempt}: {e}")
+            await asyncio.sleep(RETRY_BACKOFF * attempt)
+        return None
 
-    async def _connect(self) -> bool:
-        """
-        Establish WebSocket connection to cTrader Open API.
-        Returns True on success, False on failure.
-        """
+    async def _post(self, path: str, body: dict) -> Optional[dict]:
+        url = f"{REST_BASE}{path}"
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.post(url, headers=self._headers(), json=body,
+                                      timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT)) as r:
+                        if r.status == 401:
+                            logger.warning("POST 401 — attempting token refresh")
+                            await self._refresh_token()
+                            continue
+                        text = await r.text()
+                        try:
+                            data = json.loads(text)
+                        except Exception:
+                            data = {"raw": text}
+                        if r.status in (200, 201):
+                            return data
+                        logger.warning(f"POST {path} → HTTP {r.status}: {text[:200]}")
+            except Exception as e:
+                logger.warning(f"POST {path} attempt {attempt}: {e}")
+            await asyncio.sleep(RETRY_BACKOFF * attempt)
+        return None
+
+    # ── Token management ────────────────────────────────────────
+
+    async def _refresh_token(self) -> bool:
+        client_id     = _cfg("CTRADER_CLIENT_ID")
+        client_secret = _cfg("CTRADER_CLIENT_SECRET")
+        refresh_token = _cfg("CTRADER_REFRESH_TOKEN") if not self._token_state else self._token_state.refresh_token
+
+        if not (client_id and client_secret and refresh_token):
+            logger.error("Cannot refresh: CTRADER_CLIENT_ID / CLIENT_SECRET / REFRESH_TOKEN missing")
+            return False
+
         try:
-            import websockets
-            import ssl
-
-            ssl_context = ssl.create_default_context()
-            uri = f"wss://{CTRADER_HOST}:{CTRADER_PORT}"
-
-            logger.info(f"🔌 Connecting to {uri}...")
-            self._websocket = await asyncio.wait_for(
-                websockets.connect(uri, ssl=ssl_context),
-                timeout=15.0
-            )
-
-            # Authenticate
-            auth_msg = {
-                "type": "auth",
-                "token": CTRADER_ACCESS_TOKEN,
-                "account_id": CTRADER_ACCOUNT_ID,
+            payload = {
+                "grant_type":    "refresh_token",
+                "client_id":     client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
             }
-            await self._websocket.send(json.dumps(auth_msg))
+            async with aiohttp.ClientSession() as s:
+                async with s.post(OAUTH_TOKEN_URL, data=payload,
+                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        logger.error(f"Token refresh failed HTTP {r.status}: {await r.text()}")
+                        return False
+                    data = await r.json()
 
-            # Wait for auth response
-            response = await asyncio.wait_for(
-                self._websocket.recv(),
-                timeout=10.0
-            )
-            data = json.loads(response)
+            new_token    = data.get("access_token", "")
+            expires_in   = int(data.get("expires_in", 86400))
+            new_refresh  = data.get("refresh_token", refresh_token)
 
-            if data.get("type") == "auth_success":
-                self._connected = True
-                self._reconnect_attempts = 0
-                self._reconnect_delay = RECONNECT_BASE_DELAY
-                logger.info(f"✅ Authenticated | Account: {CTRADER_ACCOUNT_ID}")
-                return True
-            else:
-                logger.error(f"Authentication failed: {data}")
+            if not new_token:
+                logger.error("Token refresh returned empty access_token")
                 return False
 
-        except asyncio.TimeoutError:
-            logger.error("Connection timeout")
-            return False
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+            if self._token_state:
+                self._token_state.access_token           = new_token
+                self._token_state.access_token_expires_at = expiry
+                self._token_state.refresh_token          = new_refresh
+            os.environ["CTRADER_ACCESS_TOKEN"]  = new_token
+            os.environ["CTRADER_REFRESH_TOKEN"] = new_refresh
+            self._last_renewal = datetime.now(timezone.utc)
+
+            logger.info(f"✅ Access Token refreshed | expires in {expires_in}s")
+            return True
+
         except Exception as e:
-            logger.error(f"Connection error: {e}")
+            logger.error(f"Token refresh exception: {e}")
             return False
 
-    async def _disconnect(self):
-        """Close WebSocket connection gracefully."""
-        if self._websocket:
+    async def _token_renewal_loop(self):
+        logger.info("🔐 Token renewal monitor started")
+        while self._running:
             try:
-                await self._websocket.close()
+                await asyncio.sleep(TOKEN_RENEWAL_CHECK_INTERVAL)
+                if self._token_state is None:
+                    continue
+
+                if self._token_state.is_access_token_expiring_soon():
+                    logger.warning("⚠️ Access Token expiring soon — refreshing")
+                    await self._refresh_token()
+
+                elif self._token_state.is_access_token_expired():
+                    logger.error("❌ Access Token expired — refreshing")
+                    await self._refresh_token()
+
+                if self._token_state.is_refresh_token_expiring_soon(threshold_days=REFRESH_TOKEN_WARNING_DAYS):
+                    days = self._token_state.days_until_refresh_expires()
+                    logger.warning(f"⚠️ Refresh Token expiring in {days:.1f} days — renew manually")
+
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.warning(f"Error closing websocket: {e}")
-        self._connected = False
-        self._websocket = None
+                logger.error(f"Token renewal loop error: {e}")
+
+    # ── Account info ────────────────────────────────────────────
+
+    async def _fetch_account(self) -> bool:
+        """Verify account is accessible via the REST API."""
+        data = await self._get(f"/v2/webserv/traders/{CTRADER_ACCOUNT_ID}")
+        if data:
+            bal  = data.get("balance", 0) / 100.0   # cTrader returns cents
+            eq   = data.get("equity",  bal)  / 100.0
+            logger.info(f"✅ Account connected | Balance: ${bal:,.2f} | Equity: ${eq:,.2f}")
+            self._account_state = AccountState(
+                balance=bal, equity=eq,
+                open_positions=0, total_pnl=0.0
+            )
+            self._connected = True
+            if self.balance_manager:
+                self.balance_manager._equity   = eq
+                self.balance_manager._balance  = bal
+            return True
+
+        # Fallback: try listing accounts to confirm token works
+        data2 = await self._get("/v2/webserv/traders")
+        if data2 is not None:
+            logger.info("✅ API reachable (account listing OK)")
+            self._connected = True
+            return True
+
+        logger.warning("⚠️ Could not fetch account — check CTRADER_ACCOUNT_ID")
+        return False
+
+    async def _poll_account_loop(self):
+        """Poll account balance every 30 s and sync to BalanceManager."""
+        while self._running:
+            try:
+                await self._fetch_account()
+            except Exception as e:
+                logger.debug(f"Account poll error: {e}")
+            await asyncio.sleep(30)
+
+    # ── Position management ─────────────────────────────────────
+
+    async def get_positions(self) -> List[dict]:
+        """Return open positions — mirrors MCPExecutor.get_positions()."""
+        data = await self._get(f"/v2/webserv/traders/{CTRADER_ACCOUNT_ID}/positions")
+        if data is None:
+            return list(self._positions.values())
+        positions = data if isinstance(data, list) else data.get("position", data.get("positions", []))
+        self._positions = {str(p.get("positionId", p.get("id", i))): p
+                           for i, p in enumerate(positions)}
+        return positions
+
+    async def close_position(self, position_id: str, volume: Optional[float] = None) -> bool:
+        body = {"positionId": position_id}
+        if volume is not None:
+            body["volume"] = int(volume * 100)   # lots → units
+        result = await self._post(
+            f"/v2/webserv/traders/{CTRADER_ACCOUNT_ID}/positions/{position_id}/close",
+            body
+        )
+        ok = result is not None
+        logger.info(f"{'✅' if ok else '❌'} Close position {position_id}")
+        return ok
+
+    async def modify_position(self, position_id: str,
+                              stop_loss: Optional[float] = None,
+                              take_profit: Optional[float] = None) -> bool:
+        body = {}
+        if stop_loss   is not None: body["stopLoss"]   = stop_loss
+        if take_profit is not None: body["takeProfit"] = take_profit
+        if not body:
+            return False
+        result = await self._post(
+            f"/v2/webserv/traders/{CTRADER_ACCOUNT_ID}/positions/{position_id}",
+            body
+        )
+        ok = result is not None
+        logger.info(f"{'✅' if ok else '❌'} Modify SL/TP for position {position_id}")
+        return ok
+
+    # ── Order execution ─────────────────────────────────────────
+
+    async def execute_signal(self, signal: dict) -> bool:
+        """
+        Place a market order from a validated signal dict.
+        signal keys: signal_type (BUY/SELL), entry_price, stop_loss,
+                     take_profit, lot_size, symbol (default XAUUSD)
+        """
+        direction  = str(signal.get("signal_type", "BUY")).upper()
+        lot_size   = float(signal.get("lot_size",   0.01))
+        stop_loss  = float(signal.get("stop_loss",  0))
+        take_profit = float(signal.get("take_profit", 0))
+        symbol     = signal.get("symbol", "XAUUSD")
+        volume     = int(lot_size * 100_000)   # 1 lot = 100,000 units
+
+        body = {
+            "symbolName":  symbol,
+            "tradeSide":   "BUY" if direction == "BUY" else "SELL",
+            "volume":      volume,
+            "orderType":   "MARKET",
+        }
+        if stop_loss:   body["stopLoss"]   = round(stop_loss,   2)
+        if take_profit: body["takeProfit"] = round(take_profit, 2)
+
+        logger.info(
+            f"📤 Placing order | {direction} {lot_size}L {symbol} | "
+            f"SL={stop_loss:.2f} TP={take_profit:.2f}"
+        )
+
+        result = await self._post(
+            f"/v2/webserv/traders/{CTRADER_ACCOUNT_ID}/orders",
+            body
+        )
+
+        if result:
+            self._executed += 1
+            pos_id = str(result.get("positionId", result.get("orderId", "?")))
+            logger.info(f"✅ Order placed | PositionID: {pos_id}")
+            return True
+        else:
+            self._rejected += 1
+            logger.error(f"❌ Order rejected for signal: {signal}")
+            return False
+
+    # ── MCPExecutor-compatible interface ────────────────────────
+
+    def stats(self) -> dict:
+        return {
+            "mcp_connected":    self._connected,
+            "executed":         self._executed,
+            "rejected":         self._rejected,
+            "open_positions":   len(self._positions),
+        }
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    # ── Main loop ───────────────────────────────────────────────
 
     async def run_forever(self):
-        """
-        Main execution loop.
-        Runs connection manager, message listener, trailing stop monitor, and token renewal.
-        """
         self._running = True
         logger.info("CTraderOpenAPI executor started")
 
+        # Initialise token state from env
+        access_token   = _cfg("CTRADER_ACCESS_TOKEN")
+        refresh_token  = _cfg("CTRADER_REFRESH_TOKEN")
+        expires_in_raw = int(_cfg("CTRADER_TOKEN_EXPIRES_IN", "2628000"))   # sandbox default
+
+        self._token_state = TokenState(
+            access_token              = access_token,
+            refresh_token             = refresh_token,
+            access_token_expires_at   = datetime.now(timezone.utc) + timedelta(seconds=expires_in_raw),
+            refresh_token_expires_at  = datetime.now(timezone.utc) + timedelta(days=90),
+        )
+
+        # Verify connectivity
+        await self._fetch_account()
+
+        # Background tasks
+        self._tasks = [
+            asyncio.create_task(self._token_renewal_loop()),
+            asyncio.create_task(self._poll_account_loop()),
+        ]
+
         try:
-            # Initialize token state
-            access_expires = datetime.now(timezone.utc) + timedelta(hours=24)
-            refresh_expires = datetime.now(timezone.utc) + timedelta(days=90)
-            self._token_state = TokenState(
-                access_token=CTRADER_ACCESS_TOKEN,
-                refresh_token=CTRADER_REFRESH_TOKEN,
-                access_token_expires_at=access_expires,
-                refresh_token_expires_at=refresh_expires,
-            )
-
-            # Initial connection
-            await self._connect()
-
-            # Spawn background tasks
-            self._tasks = [
-                asyncio.create_task(self._token_renewal_loop()),
-                # Add other tasks as needed
-            ]
-
-            # Wait for all tasks (until cancellation)
             await asyncio.gather(*self._tasks)
-
         except asyncio.CancelledError:
             logger.info("CTraderOpenAPI executor cancelled")
         except Exception as e:
-            logger.error(f"CTraderOpenAPI executor error: {e}")
+            logger.error(f"CTraderOpenAPI executor error: {e}", exc_info=True)
         finally:
             self._running = False
-            await self._disconnect()
-            for task in self._tasks:
-                if not task.done():
-                    task.cancel()
+            for t in self._tasks:
+                if not t.done():
+                    t.cancel()
             logger.info("CTraderOpenAPI executor stopped")
 
-    def get_token_status(self) -> Dict[str, Any]:
-        """Get current token status."""
+    def get_token_status(self) -> dict:
         if not self._token_state:
             return {"status": "not_initialized"}
-
         return {
-            "access_token_expires_at": self._token_state.access_token_expires_at.isoformat(),
-            "refresh_token_expires_at": self._token_state.refresh_token_expires_at.isoformat(),
-            "access_token_expired": self._token_state.is_access_token_expired(),
+            "access_token_expires_at":    self._token_state.access_token_expires_at.isoformat(),
+            "refresh_token_expires_at":   self._token_state.refresh_token_expires_at.isoformat(),
+            "access_token_expired":       self._token_state.is_access_token_expired(),
             "access_token_expiring_soon": self._token_state.is_access_token_expiring_soon(),
-            "refresh_token_expired": self._token_state.is_refresh_token_expired(),
+            "refresh_token_expired":      self._token_state.is_refresh_token_expired(),
             "refresh_token_expiring_soon": self._token_state.is_refresh_token_expiring_soon(),
-            "days_until_refresh_expires": self._token_state.days_until_refresh_token_expires(),
-            "last_renewal": self._last_token_renewal.isoformat(),
+            "days_until_refresh_expires": self._token_state.days_until_refresh_expires(),
+            "last_renewal":               self._last_renewal.isoformat(),
+            "connected":                  self._connected,
         }
