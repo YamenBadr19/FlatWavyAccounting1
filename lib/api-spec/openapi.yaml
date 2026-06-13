@@ -1,0 +1,247 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: ctrader
+    description: cTrader Open API operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /ctrader/accounts:
+    get:
+      operationId: listCtraderAccounts
+      tags: [ctrader]
+      summary: List trading accounts
+      description: Returns all trading accounts linked to the cTrader access token
+      responses:
+        "200":
+          description: List of trading accounts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CtraderAccountsResponse"
+        "502":
+          description: cTrader API error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /ctrader/accounts/{accountId}/positions:
+    get:
+      operationId: getCtraderPositions
+      tags: [ctrader]
+      summary: Get open positions
+      description: Returns open positions for a specific trading account
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Open positions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CtraderPositionsResponse"
+        "502":
+          description: cTrader API error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /ctrader/accounts/{accountId}/deals:
+    get:
+      operationId: getCtraderDeals
+      tags: [ctrader]
+      summary: Get deal history
+      description: Returns closed deals for a specific trading account
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: integer
+            description: Unix timestamp (ms) start
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: integer
+            description: Unix timestamp (ms) end
+      responses:
+        "200":
+          description: Deals history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CtraderDealsResponse"
+        "502":
+          description: cTrader API error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error
+
+    CtraderAccount:
+      type: object
+      properties:
+        accountId:
+          type: string
+        traderLogin:
+          type: integer
+        accountType:
+          type: string
+        balance:
+          type: number
+        currency:
+          type: string
+        leverageInCents:
+          type: integer
+        brokerName:
+          type: string
+        isLive:
+          type: boolean
+      required:
+        - accountId
+        - traderLogin
+        - accountType
+        - balance
+        - currency
+        - leverageInCents
+        - brokerName
+        - isLive
+
+    CtraderAccountsResponse:
+      type: object
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/CtraderAccount"
+      required:
+        - accounts
+
+    CtraderPosition:
+      type: object
+      properties:
+        positionId:
+          type: string
+        symbol:
+          type: string
+        tradeSide:
+          type: string
+        volume:
+          type: number
+        entryPrice:
+          type: number
+        currentPrice:
+          type: number
+        pnl:
+          type: number
+        openTimestamp:
+          type: integer
+      required:
+        - positionId
+        - symbol
+        - tradeSide
+        - volume
+        - entryPrice
+        - currentPrice
+        - pnl
+        - openTimestamp
+
+    CtraderPositionsResponse:
+      type: object
+      properties:
+        positions:
+          type: array
+          items:
+            $ref: "#/components/schemas/CtraderPosition"
+      required:
+        - positions
+
+    CtraderDeal:
+      type: object
+      properties:
+        dealId:
+          type: string
+        symbol:
+          type: string
+        tradeSide:
+          type: string
+        volume:
+          type: number
+        executionPrice:
+          type: number
+        commission:
+          type: number
+        pnl:
+          type: number
+        closeTimestamp:
+          type: integer
+      required:
+        - dealId
+        - symbol
+        - tradeSide
+        - volume
+        - executionPrice
+        - commission
+        - pnl
+        - closeTimestamp
+
+    CtraderDealsResponse:
+      type: object
+      properties:
+        deals:
+          type: array
+          items:
+            $ref: "#/components/schemas/CtraderDeal"
+      required:
+        - deals
